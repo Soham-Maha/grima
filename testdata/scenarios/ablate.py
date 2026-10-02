@@ -113,6 +113,7 @@ DEFAULT_BENIGN = [
     "benign-archive.sh",
     "benign-media-encode.sh",
     "benign-atomic-save.sh",
+    "benign-git-objects.sh",
 ]
 
 # One pool per rate, sized so the workload outlives the detector's evaluation
@@ -244,6 +245,7 @@ class Run:
         self.max_score = 0.0
         self.max_level = 0
         self.best_signals: list[str] = []
+        self.signal_values: dict[str, float] = {}
         self._log_pos = 0
         self._poll_at = 0.0
 
@@ -270,6 +272,13 @@ class Run:
                 self.max_score = v["Score"]
                 self.max_level = v.get("Level", 0)
                 self.best_signals = [s["Name"] for s in (v.get("Signals") or [])]
+            # The highest value each signal reached, so a characterisation like
+            # §17's "what does the n-gram share look like on this workload" is
+            # reproducible from the harness rather than from a scratch program.
+            for s in v.get("Signals") or []:
+                name = s["Name"]
+                if s["Value"] > self.signal_values.get(name, 0.0):
+                    self.signal_values[name] = round(s["Value"], 3)
 
     def tick(self) -> None:
         self.scan_log()
@@ -301,7 +310,7 @@ def run_scenario(run: Run, argv: list[str], timeout: float) -> dict:
     summary_line: str | None = None
     started = time.monotonic()
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1, env=scenario_env())
     assert proc.stdout is not None
     deadline = started + timeout
     for line in proc.stdout:
@@ -361,16 +370,44 @@ def warmup_workload(data: str, seconds: float) -> None:
         time.sleep(2)
 
 
+def scenario_env() -> dict:
+    """Environment for a workload.
+
+    GNU tar reads `C:/...` as a remote `host:path` and silently produces no
+    archive under Git Bash, which would make the archive workload look silent
+    because it wrote nothing. benign-fp-check.sh does the same for the same
+    reason.
+    """
+    env = dict(os.environ)
+    try:
+        version = subprocess.run(["tar", "--version"], capture_output=True, text=True, timeout=10).stdout
+        if "GNU tar" in version:
+            env["TAR_OPTIONS"] = f"--force-local {env.get('TAR_OPTIONS', '')}".strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return env
+
+
+def time_workload(argv: list[str]) -> float:
+    """One pass, timed, before the detector exists. The calibration window has to
+    cover a whole workload pass: a window shorter than the pass leaves the pass's
+    own late writes — and therefore their extensions — outside the baseline, and
+    the measured pass then reports them as first-seen novelty. That is the defect
+    that made npm look like a false positive (sprints.md §21), and it is why this
+    pass exists rather than a fixed window."""
+    started = time.monotonic()
+    subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                   env=scenario_env(), timeout=BENIGN_TIMEOUT + 120)
+    return time.monotonic() - started
+
+
 def calibrate(binary: str, config: str, data: str, warmup_seconds: float,
               warmup_argv: list[str] | None = None) -> str:
     """Capture a baseline, returning the detector's log for the record.
 
     For an attack run the warm-up is synthetic text: the pool is static, and what
     the attack then does to it is the deviation. For a benign workload the
-    workload itself runs during calibration, because a baseline that never saw
-    the workload's extensions reports them as first-seen novelty in the measured
-    pass — which is the harness defect that made npm look like a false positive
-    (sprints.md §21), reproduced deliberately here if this is skipped.
+    workload itself runs during calibration, inside a window sized to cover it.
     """
     log_path = os.path.join(os.path.dirname(config), "calibrate.log")
     with open(log_path, "w", encoding="utf-8", errors="replace") as log:
@@ -379,7 +416,7 @@ def calibrate(binary: str, config: str, data: str, warmup_seconds: float,
             warmup_workload(data, warmup_seconds)
         else:
             subprocess.run(warmup_argv, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
-                           timeout=warmup_seconds + 120)
+                           env=scenario_env(), timeout=warmup_seconds + 120)
         try:
             proc.wait(timeout=warmup_seconds + 60)
         except subprocess.TimeoutExpired:
@@ -414,6 +451,13 @@ def one_run(args, binary: str, subset: str, scenario: str, kind: str, rnd: int) 
 
     warmup_seconds = float(args.warmup.rstrip("s")) if args.warmup.endswith("s") else 15.0
     if calibrated:
+        if kind == "benign":
+            # Size the window to the workload before the detector is told how
+            # long to calibrate: a fixed window shorter than the pass is the
+            # §21 defect, and it shows up as a false positive on the workload
+            # whose late writes fell outside it.
+            warmup_seconds = max(warmup_seconds, time_workload(scenario_argv) + 5.0)
+            write_config(config, data, baseline, subset, calibrated, f"{warmup_seconds:.0f}s")
         calibrate(binary, config, data, warmup_seconds,
                   warmup_argv=None if kind == "attack" else scenario_argv)
 
@@ -428,6 +472,13 @@ def one_run(args, binary: str, subset: str, scenario: str, kind: str, rnd: int) 
     finally:
         run.stop()
 
+    if kind == "benign":
+        # Byte figures come from the encryptor's progress lines, so they mean
+        # nothing for a workload that has none. Reporting 0 would read as
+        # "detected before a single byte", which is not what happened.
+        detail["bytes_written"] = None
+        detail["ttd_bytes"] = None
+
     row = {
         "subset": subset,
         "scenario": scenario,
@@ -437,6 +488,7 @@ def one_run(args, binary: str, subset: str, scenario: str, kind: str, rnd: int) 
         "max_level": LEVELS[run.max_level],
         "alerts": run.alerts,
         "signals": run.best_signals,
+        "signal_values": run.signal_values,
         **detail,
     }
     if not args.keep:
