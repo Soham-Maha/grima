@@ -27,6 +27,10 @@ import (
 
 const name = "filewatch"
 
+// addQueueDepth bounds directories waiting for a watch. A full queue drops and
+// counts, rather than blocking the event loop.
+const addQueueDepth = 256
+
 // Source watches the configured directories.
 type Source struct {
 	cfg    config.Config
@@ -38,6 +42,13 @@ type Source struct {
 	done    chan struct{}
 	closeMu sync.Once
 	wg      sync.WaitGroup
+
+	// addQueue carries directories that need a watch. They are added by
+	// addWorker rather than by whoever saw them, because fsnotify's Add
+	// handshakes with the backend reader and that reader blocks while an event
+	// is waiting to be consumed.
+	addQueue   chan string
+	addDropped atomic.Uint64
 
 	events   atomic.Uint64
 	errors   atomic.Uint64
@@ -68,6 +79,16 @@ func (s *Source) Start(ctx context.Context, out chan<- event.Event) error {
 	}
 	s.watcher = watcher
 
+	// The consumer starts before the first watch is added. fsnotify's Add
+	// handshakes with its backend reader, and that reader blocks while an event
+	// is waiting to be consumed — so adding watches with no consumer running
+	// deadlocks both sides. Measured as a multi-minute startup stall on a
+	// 403-directory tree that was being written to (sprints.md §23).
+	s.addQueue = make(chan string, addQueueDepth)
+	s.wg.Add(2)
+	go s.loop(ctx, out)
+	go s.addWorker(ctx)
+
 	watched := 0
 	for _, root := range s.cfg.General.MonitorPaths {
 		n, err := addTree(watcher, root)
@@ -78,13 +99,12 @@ func (s *Source) Start(ctx context.Context, out chan<- event.Event) error {
 	}
 	if watched == 0 {
 		watcher.Close()
+		s.closeMu.Do(func() { close(s.done) })
 		return fmt.Errorf("%s: no directory under %v could be watched", name, s.cfg.General.MonitorPaths)
 	}
 
 	s.log.Info("watching directories", "source", name, "count", watched)
 
-	s.wg.Add(1)
-	go s.loop(ctx, out)
 	return nil
 }
 
@@ -111,11 +131,41 @@ func (s *Source) Stats() sensor.Stats {
 		Extra: map[string]uint64{
 			"overflow":            s.overflow.Load(),
 			"rescans":             s.rescans.Load(),
+			"add_dropped":         s.addDropped.Load(),
 			"attrib_causal_hits":  attribution.CausalHits,
 			"attrib_correlate":    attribution.CausalMisses,
 			"attrib_pending_drop": attribution.PendingDrops,
 			"attrib_source_error": attribution.Source.Errors,
 		},
+	}
+}
+
+// enqueueAdd queues a directory for watching. A full queue is counted, never
+// silent: a directory whose watch is missed stays invisible until the next
+// rescan, and the count is what says so.
+func (s *Source) enqueueAdd(path string) {
+	select {
+	case s.addQueue <- path:
+	default:
+		s.addDropped.Add(1)
+	}
+}
+
+// addWorker registers queued directories, off the event loop.
+func (s *Source) addWorker(ctx context.Context) {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.done:
+			return
+		case path := <-s.addQueue:
+			if _, err := addTree(s.watcher, path); err != nil {
+				s.log.Warn("partial watch", "path", path, "error", err)
+			}
+		}
 	}
 }
 
@@ -158,12 +208,13 @@ func (s *Source) handle(fsEv fsnotify.Event, out chan<- event.Event) {
 	path := fsEv.Name
 
 	// A new directory needs its own watch, or everything created inside it is
-	// invisible from here on.
+	// invisible from here on. The watch is queued, not added here: this
+	// goroutine is the only consumer of the events that fsnotify's Add waits
+	// behind, so adding inline would stall the sensor under load.
 	if fsEv.Op&fsnotify.Create != 0 {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			if _, err := addTree(s.watcher, path); err == nil {
-				return
-			}
+			s.enqueueAdd(path)
+			return
 		}
 	}
 
