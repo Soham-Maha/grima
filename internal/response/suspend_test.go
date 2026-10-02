@@ -92,10 +92,14 @@ func fileSize(t *testing.T, path string) int64 {
 }
 
 // The child writes every 10ms; 250ms is long enough that a running child could
-// not coincidentally leave the file unchanged.
+// not coincidentally leave the file unchanged. The first sample waits for the
+// suspension to settle: a thread already inside a write completes it after the
+// suspend call returns, so sampling at the instant of the call can catch a byte
+// that was already in flight.
 func assertStopped(t *testing.T, file string) {
 	t.Helper()
 
+	time.Sleep(100 * time.Millisecond)
 	stopped := fileSize(t, file)
 	time.Sleep(250 * time.Millisecond)
 	if grew := fileSize(t, file); grew != stopped {
