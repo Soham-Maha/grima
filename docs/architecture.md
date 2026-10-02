@@ -152,8 +152,9 @@ Backed by `fsnotify`, which maps to the native notification API per OS. Emits
 Two operational hazards are handled explicitly rather than assumed away:
 
 - **Overflow.** Windows' `ReadDirectoryChangesW` buffer can overflow, dropping events
-  silently. On overflow, FileWatch re-scans the affected subtree and emits synthetic
-  events so the window does not under-count.
+  silently. On overflow, FileWatch re-scans the monitored tree and emits synthetic
+  events so the window does not under-count. The error carries no path, so the rescan
+  covers every configured root, filtered to files changed in the last few seconds.
 - **Watch exhaustion.** Linux inotify has no recursive watch; `fsnotify` emulates
   recursion with one watch per directory and can exhaust `max_user_watches` on large
   trees. Watch failures are counted and surfaced, never swallowed.
@@ -504,44 +505,48 @@ is testable.
 
 | Failure | Consequence | Handling |
 |---|---|---|
-| Filesystem event overflow | Window under-counts | Re-scan subtree, emit synthetic events, count the occurrence |
+| Filesystem event overflow | Window under-counts | Re-scan the monitored tree, emit synthetic events, count the occurrence |
 | inotify watch exhaustion | Some directories unmonitored | Log, count, surface in dashboard health |
 | Bus saturation | Events dropped | Explicit drop policy + drop counter as its own signal |
 | No baseline yet | Deviation signals unavailable | Uncalibrated mode: overrides, magic-byte checks, and an absolute write-rate fallback; stated in the UI |
-| Attribution ambiguous | Wrong process blamed | Attribution confidence field; prefer tree-level attribution when per-process confidence is low |
-| Monitor process killed | No detection | Documented limitation. Service supervision + out-of-process append-only log are the mitigation, not a solution. |
+| Attribution ambiguous | Wrong PID on the alert | Events carry an attribution confidence. The shipped default (host mode) makes no per-process claim at all and files evidence against the host/tree fingerprint; `correlate` reports the top writer's share of recent bytes, and Windows auditing reports the OS-reported writer at 1.0 |
+| Monitor process killed | No detection | Documented limitation, not solved in-binary. The mitigation is deployment-level: service supervision and an append-only log shipped out of process, so a killed monitor is restarted and leaves a record. GRIMA cannot detect while it is dead. |
 
 ### Attribution accuracy is the weakest link
 
-User-space notification APIs report *that* a file changed, not *who* changed it. GRIMA
-correlates file events against per-process write-byte counters, and that heuristic has a
-measured failure mode: **a process doing high-volume background I/O outcompetes a
-process doing many small writes.**
+User-space notification APIs report *that* a file changed, not *who* changed it.
+Correlating a file event against per-process write-byte counters was measured at **0%
+accuracy** (1,255 decisions against a solo writer): a process doing high-volume
+background I/O always outcompetes one doing many small writes. On a Windows host an
+encryptor rewriting 65 small files was blamed on `firefox.exe`, which was concurrently
+writing more bytes to its cache.
 
-Observed during smoke testing on a Windows host: an encryptor rewriting 65 small files
-was attributed to `firefox.exe`, which was concurrently writing more bytes to its cache.
-The detection was still correct — the evidence landed in one fingerprint and the verdict
-fired at critical — but the blamed PID was wrong.
+The shipped default, `attribution.mode = "host"`, therefore makes no per-process claim:
+file events keep PID 0 and are filed against the host fingerprint, so evidence is not
+split across a guessed PID — which is how a 1-file-per-5s drip previously reached no
+alert at all. `correlate` keeps the write-volume heuristic and reports the top writer's
+share of recent bytes as `AttribConfidence`, so a weak blame is visible rather than
+asserted; its attribution window is two process-sample intervals, so a process that
+stopped writing is not blamed.
 
-This matters because it corrupts two things: which process appears in the alert, and the
-per-process write-rate baseline captured during calibration.
-
-Mitigations in place: the attribution window is two process-sample intervals, so a
-process that stopped writing is not blamed; confidence is reported on every event.
-
-The real fix is causal attribution rather than correlation, and it does not require a
-custom driver: **ETW** (`Microsoft-Windows-Kernel-File`) on Windows and **auditd** or
-**eBPF** on Linux both report the writing PID directly and are OS-provided. That is
-Phase 1 work, and attribution accuracy should be measured in Phase 6 alongside detection
-rate.
+Causal attribution takes the writer from the operating system instead. It is implemented
+on Windows as file-system auditing (Security event 4663) behind `attribution.mode =
+"audit"`, needs `SeSecurityPrivilege` plus an audit ACE per directory, and measured
+**96.9%** (945 of 975 decisions) on an elevated host; see `sprints.md` §11 and §14. ETW
+(`Microsoft-Windows-Kernel-File`) was evaluated and rejected: it is a privileged kernel
+provider whose write events carry a thread id and no path. No causal source exists for
+Linux yet (auditd or eBPF is future work), so Linux runs in host or correlate mode.
 
 ### Alert repetition
 
-A process that stays above a level threshold is re-reported on every scoring tick — once
-per second by default. This is intentional (risk is continuous, not a point event) but it
-means the log repeats while a condition persists. Operators who want one alert per
-incident should dedupe on `(PID, level, Override)` in their log pipeline; per-process
-alert throttling is a Phase 5 option.
+With `response.alert_cooldown = 0` (the default) a process that stays above the level
+threshold is re-reported on every scoring tick — once per second by default. This is
+intentional (risk is continuous, not a point event) but it means the log repeats while a
+condition persists. Setting `response.alert_cooldown` holds repeat alerts for one
+incident: the incident is keyed by the tree root, a verdict below the alert band ends it
+immediately, and the cooldown expiring re-arms the next alert. With the cooldown left off,
+operators who want one alert per incident must dedupe on `(PID, level, Override)` in their
+log pipeline.
 
 ---
 
