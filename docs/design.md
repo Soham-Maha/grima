@@ -701,6 +701,8 @@ rescan_on_overflow   = true
 enabled        = true
 names          = ["_grima_canary.doc", "quarterly_report.xlsx"]
 count_per_dir  = 2
+max_depth      = 0                     # 0 plants in the monitored roots only
+manifest_path  = "grima-decoys.json"   # records what was planted, for --remove-decoys
 
 [window]
 decay_half_life = "30s"
@@ -730,6 +732,27 @@ alert_cooldown    = "0s"               # 0 disables per-incident alert throttlin
 enabled = true
 listen  = "127.0.0.1:8787"
 ```
+
+### Decoy planting is bounded and recorded
+
+Planting decoys writes real files into directories the operator monitors. That is a side
+effect on the filesystem, not only on the detector, so two rules apply:
+
+- **Depth is bounded and defaults to zero.** Decoys go in the monitored roots and nowhere
+  else unless `decoy.max_depth` asks for more. Recursing to depth 3 with `count_per_dir = 2`
+  writes two plausible-looking documents into *every* directory of the tree — measured at
+  **66 files across 33 directories from a three-second run** over a small tree — and on a
+  real home directory that is thousands of files appearing in the user's folders, their
+  version control and their backups, under names designed to look like the user's own work.
+- **Every planted path is recorded, and the run has an undo.** `decoy.manifest_path` is a
+  union across runs, so `grima --remove-decoys` removes decoys planted earlier, or under a
+  different depth, and works after a restart or a crash. Removal only deletes a file whose
+  contents are still the canary body: a path the user has since replaced with a real
+  document is left in place and reported as skipped. The manifest says where the tool wrote,
+  not that whatever is there now belongs to it.
+
+`decoy.manifest_path` is required while decoys are enabled — planting without a record is
+planting files that can never be removed.
 
 ---
 

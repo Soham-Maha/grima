@@ -39,6 +39,10 @@ go.work.sum
 grima-baseline.json
 *-baseline.json
 
+# Decoy manifest: records the canary paths planted on this machine, so it is
+# machine specific too.
+grima-decoys.json
+
 # Local run: the one-command launcher, its config and its watched directory are
 # machine specific. Recreate the launcher from the README's PowerShell section.
 /run-grima.ps1

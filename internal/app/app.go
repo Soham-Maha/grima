@@ -25,9 +25,10 @@ import (
 
 // Options are the runtime knobs that come from the command line.
 type Options struct {
-	Duration    time.Duration
-	Calibrate   bool
-	Recalibrate bool
+	Duration     time.Duration
+	Calibrate    bool
+	Recalibrate  bool
+	RemoveDecoys bool
 }
 
 const sensorBuffer = 4096
@@ -38,6 +39,13 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, opts.Duration)
 		defer cancel()
+	}
+
+	// Removing decoys is a maintenance action, not a run: it touches the files
+	// this tool wrote and nothing else, so it happens before any sensor or bus
+	// exists.
+	if opts.RemoveDecoys {
+		return runRemoveDecoys(cfg, log)
 	}
 
 	policy, _ := bus.ParseDropPolicy(cfg.Bus.DropPolicy)
@@ -58,7 +66,11 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 		if err != nil {
 			log.Warn("decoy planting partially failed", "error", err)
 		}
-		log.Info("decoys planted", "count", planted)
+		log.Info("decoys planted",
+			"count", planted,
+			"manifest", cfg.Decoy.ManifestPath,
+			"max_depth", cfg.Decoy.MaxDepth,
+		)
 	}
 
 	sources, err := startSensors(ctx, cfg, host, events, log)
@@ -178,6 +190,25 @@ func pumpToBus(ctx context.Context, out <-chan event.Event, events *bus.Bus) {
 			events.Publish(ev)
 		}
 	}
+}
+
+// runRemoveDecoys deletes the canary files a previous run planted, using the
+// manifest that run wrote. It is the undo for a tool that writes into the user's
+// directories.
+func runRemoveDecoys(cfg config.Config, log *slog.Logger) error {
+	removed, skipped, err := decoy.Remove(cfg.Decoy.ManifestPath)
+	if err != nil {
+		return fmt.Errorf("remove decoys: %w", err)
+	}
+
+	log.Info("decoys removed", "removed", removed, "manifest", cfg.Decoy.ManifestPath)
+	if skipped > 0 {
+		// A skipped path held something that is not the canary body any more.
+		// Deleting it would delete the user's file, so it is left and reported.
+		log.Warn("some recorded decoys were left in place: their contents are no longer the canary body",
+			"skipped", skipped)
+	}
+	return nil
 }
 
 func runCalibration(ctx context.Context, cfg config.Config, events *bus.Bus, log *slog.Logger) error {

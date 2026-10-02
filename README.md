@@ -86,6 +86,25 @@ Anything outside that list is invisible to the detector, and GRIMA **rejects unk
 configuration keys** rather than ignoring them, so a typo fails at startup instead of
 silently disabling a setting.
 
+### Decoys write files into the directories you monitor
+
+GRIMA plants canary files so that a process touching one is caught immediately. That is a
+change to your filesystem, so it is worth knowing before the first run:
+
+- By default the canaries go in the monitored directories themselves and **nowhere deeper**
+  (`decoy.max_depth = 0`). Setting it higher plants `count_per_dir` files in every directory
+  down to that depth, which on a home directory is a lot of files.
+- Every planted path is recorded in `decoy.manifest_path` (default `grima-decoys.json`), and
+  the run is undone with:
+
+  ```sh
+  grima --config grima.toml --remove-decoys
+  ```
+
+  It removes exactly the recorded files, and only while their contents are still the canary
+  body — a decoy you replaced with a real document is left alone. Set `decoy.enabled = false`
+  to skip planting entirely.
+
 ### 2. Calibrate
 
 ```sh

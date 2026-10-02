@@ -98,6 +98,12 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		"negative weight": func(c *Config) {
 			c.Scoring.Weights = []Weight{{Name: "entropy_deviation", Weight: -1}}
 		},
+		"negative decoy depth": func(c *Config) { c.Decoy.MaxDepth = -1 },
+		"planting without a manifest": func(c *Config) {
+			// Without a manifest there is no record of what was written, so the
+			// decoys could never be removed.
+			c.Decoy.ManifestPath = ""
+		},
 	}
 
 	for name, mutate := range cases {

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -15,6 +17,7 @@ import (
 	"github.com/prateekpurohit13/grima/internal/bus"
 	"github.com/prateekpurohit13/grima/internal/calibrate"
 	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/decoy"
 	"github.com/prateekpurohit13/grima/internal/event"
 	"github.com/prateekpurohit13/grima/internal/fingerprint"
 	"github.com/prateekpurohit13/grima/internal/platform"
@@ -447,5 +450,40 @@ func TestHealthPublishesBaselineSampleCounts(t *testing.T) {
 		if got := health.Extra[name]; got != want {
 			t.Errorf("health %s = %d, want %d", name, got, want)
 		}
+	}
+}
+
+// Decoys are written into the user's own directories, so the run has to have an
+// undo that works from the manifest alone — after a restart, with nothing in
+// memory. This drives the real planting and the real removal.
+func TestRemoveDecoysUndoesAPreviousRun(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Decoy.Enabled = true
+	cfg.Decoy.ManifestPath = filepath.Join(t.TempDir(), "grima-decoys.json")
+
+	reg := decoy.NewRegistry()
+	planted, err := decoy.Plant(cfg, reg)
+	if err != nil {
+		t.Fatalf("Plant: %v", err)
+	}
+	if planted == 0 {
+		t.Fatal("nothing was planted; the test would measure nothing")
+	}
+
+	if err := runRemoveDecoys(cfg, slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("runRemoveDecoys: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("%d files survived removal", len(entries))
+	}
+	if _, err := os.Stat(cfg.Decoy.ManifestPath); !os.IsNotExist(err) {
+		t.Fatalf("manifest survived removal: %v", err)
 	}
 }

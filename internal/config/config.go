@@ -94,6 +94,16 @@ type DecoyConfig struct {
 	Enabled     bool     `toml:"enabled"`
 	Names       []string `toml:"names"`
 	CountPerDir int      `toml:"count_per_dir"`
+	// MaxDepth bounds how far below each monitored root decoys are planted.
+	// Zero plants only in the roots themselves. Recursing writes files into the
+	// user's directories — two per directory — so it is opt-in rather than the
+	// default.
+	MaxDepth int `toml:"max_depth"`
+	// ManifestPath records every path planted, so --remove-decoys can undo this
+	// run and earlier ones. Without it a decoy planted before a crash, or under
+	// a different configuration, is indistinguishable from the user's own file
+	// and is never removed.
+	ManifestPath string `toml:"manifest_path"`
 }
 
 // WindowConfig holds fingerprint window settings.
@@ -254,9 +264,11 @@ func Default() Config {
 			AuditSetup: true,
 		},
 		Decoy: DecoyConfig{
-			Enabled:     true,
-			Names:       []string{"_grima_canary.doc", "quarterly_report_2019.xlsx", "invoices_backup.pdf"},
-			CountPerDir: 2,
+			Enabled:      true,
+			Names:        []string{"_grima_canary.doc", "quarterly_report_2019.xlsx", "invoices_backup.pdf"},
+			CountPerDir:  2,
+			MaxDepth:     0,
+			ManifestPath: "grima-decoys.json",
 		},
 		Window: WindowConfig{
 			DecayHalfLife: Duration(30 * time.Second),
@@ -356,6 +368,13 @@ func (c Config) Validate() error {
 	}
 	if c.Scoring.ZeroBaselineBurst <= 0 {
 		return fmt.Errorf("scoring.zero_baseline_burst must be positive, got %v", c.Scoring.ZeroBaselineBurst)
+	}
+	if c.Decoy.MaxDepth < 0 {
+		return fmt.Errorf("decoy.max_depth must not be negative, got %d", c.Decoy.MaxDepth)
+	}
+	if c.Decoy.Enabled && c.Decoy.ManifestPath == "" {
+		// Planting without a manifest is planting files that cannot be removed.
+		return fmt.Errorf("decoy.manifest_path must be set while decoys are enabled")
 	}
 	if err := c.validateAttribution(); err != nil {
 		return err
