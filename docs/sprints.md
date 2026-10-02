@@ -33,6 +33,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 24. [The Cerberus Split: What Is Asserted, and What Is Only Measured](#24-the-cerberus-split-what-is-asserted-and-what-is-only-measured)
 25. [Startup Has No Bound Under Load — Proposed Design Change](#25-startup-has-no-bound-under-load--proposed-design-change)
 26. [Corroboration Is Structural, Not Arithmetic](#26-corroboration-is-structural-not-arithmetic)
+27. [The Ablation: Which Signals Actually Carry Detection](#27-the-ablation-which-signals-actually-carry-detection)
 
 ---
 
@@ -299,6 +300,25 @@ whose arithmetic is wrong.
 
 **Carried in from Sprint 3.** Item 4.13 is the live half of the split claim, which cannot be
 measured while the writer is a guess (§24).
+
+### Sprint 4 outcome
+
+| # | Item | Result |
+|---|---|---|
+| 4.1 | Benign corpus | ✅ **Six workloads**, each with a recorded activity profile and a verdict, driven by `benign-corpus.sh` through the real false-positive harness. A sixth was added because it stresses the most signals at once: a git-shaped object/tree write (deflated blobs, extensionless names, temp-then-rename, then a repack that deletes 164 loose objects in a burst). Over two rounds **all six stayed silent**: npm peaks 23.4 low, atomic-save 21.7 low, compile 5.0 info, archive/media-encode/git-objects publish no verdict. A workload with no `SUMMARY` line is an error row, never a silent pass. |
+| 4.2 | Attack corpus | ⚠️ **Partly met.** The controlled encryptor at three rates (`burst`, `drip`, `intermittent`) is shipped and drives the ablation. **Real ransomware families are not measured**: the sprint's safety note requires an isolated snapshot VM with a host-only network, which this environment does not have. Detection on real families is therefore unmeasured, and saying otherwise would be a claim with no evidence behind it. |
+| 4.3 | Ablation runner | ✅ `ablate.py`: subsets by zeroing weights outside the subset, so a signal still appears as evidence but cannot move the decision. Cumulative `rules_only` → `+entropy` → `+rename` → `+calibration` → `all`. One round measured over the full corpus; the result is in §27. |
+| 4.4 | Metrics | ✅ Detection rate at the 1% false-positive point from a score sweep, TTD in bytes (median and p95), false positives per 24h. TTD comes from the encryptor's own progress lines, so the metric is bytes-encrypted-before-alert rather than a duration. Scores are corrected from each run's alert lines, because polling `/api/verdicts` can miss the peak that alerted. |
+| 4.5 | Generalization split | ✅ `tune-weights.py` does leave-one-attack-rate-out and leave-one-benign-workload-out; both gaps are **+0.000** on this corpus. **It also states plainly that the corpus has one attack family**, so cross-family generalization is not measurable here and the gap bounds tuning bias only. |
+| 4.6 | Weight tuning | ✅ Offline grid search over the recorded signal values, with the shipped fusion rule ported and checked against the Go scorer by a self-test of 13 golden signal sets. 101 vectors evaluated against the shipped table: **no change improves it**. The useful result is negative — on this corpus the weight table is not the lever. |
+| 4.7 | Figures | ✅ `ablate-figures.py`: the ablation table as markdown, the TTD distribution as a text histogram with the raw values, and ROC/PR as CSV with the 1% operating point marked. The sweep is a step function over a handful of points and the output says so rather than smoothing it. |
+| 4.8 | Overhead | ✅ Detector idle 3.25% of one core (peak 5.74%) at 131 MiB RSS; under load 6.11% (peak 12.47%) at 159 MiB. The workload costs the same with and without the detector (7.128 vs 7.073 %1core, 19s vs 18s), so the overhead is a difference and not a number in isolation. Cleanup verified on both paths. |
+| 4.9 | Solo alertability | ✅ **Closed by a structural rule, not arithmetic**: a Secondary signal fuses only while a Primary is present. Five saturated Secondaries with no Primary fused to 86.2 high, and `static_reputation` is configured at 0.6 (60.0 medium) for the day Phase 7 emits it. Weights unchanged; every signal in the table is now priced by `alertability_test.go`. See §26. |
+| 4.10 | Extension novelty | ✅ Alert kept, cost stated: 23 novel writes cross the band, 30 files score 60.0. A minimum-novelty floor was rejected because the floor that moves 30 novel files below the band also silences the 24-file quiet drip that item 2.2 rests on. See §26. |
+| 4.11 | Re-run the signal measurements | ✅ The numbers no longer live in a scratch directory: §17's characterisation is pinned by `internal/fingerprint/split_test.go`, §18's solo alertability by `internal/score/alertability_test.go`, and the live per-scenario signal values are recorded by the ablation runner, so a characterisation can be re-derived from a recorded run. |
+| 4.12 | Per-round spread | ✅ Every headline figure is a range over rounds (`min..max`, with the round count), and a one-round run is labelled a single observation rather than presented as a spread. |
+| 4.13 | Split under causal attribution | ⚠️ **Not measurable here.** Needs `attribution.mode = "audit"` on an elevated host; this environment is not elevated, and the correlate fallback is a byte-volume guess (§24). Carried forward with the reason rather than closed. |
+| 4.14 | Bound `FileWatch` startup | ✅ `filewatch.startup_deadline` (default 10s) bounds the walk; the remainder is queued and counted as `add_pending`, the root is always registered inline, and a full queue falls back to registering inline rather than leaving a directory blind. The 403-directory tree still registers inline in 92ms; a 600-directory tree with a nanosecond deadline returns at once and ends fully covered. See §25. |
 
 ---
 
@@ -1912,3 +1932,76 @@ on the shipped binary: smoke **100.0 critical**, `rates.sh quiet-drip` still cro
 medium** (the cumulative track is a Primary, so the gate does not touch it), `cerberus.sh split`
 **95.2 critical**. The benign corpus was re-measured after the change as well: all six workloads
 silent, npm peaking at 23.4 low.
+
+---
+
+## 27. The Ablation: Which Signals Actually Carry Detection
+
+One round, five subsets, the same corpus — three attack rates against the controlled encryptor
+and six benign workloads, every row on the same detector with the same window. Produced by
+`python testdata/scenarios/ablate.py --rounds 1` and rendered by `ablate-figures.py`:
+
+| Subset | Detected | DR @ 1% FPR | TTD median | TTD p95 | FPR / 24h | Benign alerts |
+|---|---|---|---|---|---|---|
+| `rules_only` | **0 / 3** | 0.0 | — | — | 0.0 | 0 |
+| `+entropy` | 3 / 3 | **1.0** | 136 KiB | 9.5 MB | **0.0** | 0 |
+| `+rename` | 3 / 3 | **no feasible point** | 140 KiB | 7.7 MB | **10568.8** | **16** |
+| `+calibration` | 3 / 3 | 1.0 | 140 KiB | 9.3 MB | 1379.1 | 2 |
+| `all` | 3 / 3 | 1.0 | 140 KiB | 9.6 MB | 5139.0 | 8 |
+
+### What the table says
+
+**The rule layer does not detect a generic encryptor, and was never meant to.** `rules_only`
+scores 0 of 3: the controlled encryptor deletes and renames nothing that the anti-recovery
+rules match. That is worth stating plainly rather than leaving as an implication — GRIMA's
+rules are a floor for known anti-recovery *commands*, and detection of encryption itself rests
+entirely on the behavioural signals.
+
+**Content signals are the workhorses.** `+entropy` — entropy deviation and magic-byte
+mismatch, nothing else — detects all three rates, at **zero false positives across six benign
+workloads**, with a median time-to-detect of 136 KiB. Two signals carry the result.
+
+**The rename and extension group is not deployable without a baseline.** `+rename` adds no
+detection (`+entropy` already has 3 of 3) and adds **16 alerts across the benign corpus** —
+`benign-atomic-save` alone scores 100 critical, because its `.tmp` and `.log` writes are
+first-seen extensions to a detector that has no baseline. There is **no threshold at which it
+meets a 1% false-positive budget**, which is what the `—` in that row means: the subset is
+unusable in that configuration, not merely worse.
+
+**Calibration is what makes the rename group safe.** `+calibration` keeps DR at 1.0 and brings
+the benign corpus back to 2 alerts, because the baseline has learned the host's extensions and
+rates. This is the paper's thesis as a measurement rather than an argument: the same signals
+are a liability uncalibrated and a corroboration calibrated.
+
+### What the table does not say, and must not be read as saying
+
+**One round is one observation.** `+calibration` (1379/24h) and `all` (5139/24h) differ, but
+with a single round that difference is run-to-run variance, not a signal — two runs of one
+scenario have already disagreed by 44 points for a purely environmental reason (§15). The
+harness reports spreads, and this table has none: `--rounds 3` is the command that turns these
+into ranges, and until it is run, no comparison between those two rows is defensible.
+
+**Time-to-detect is read from the workload's own progress lines.** It is meaningful only where
+the attack outlived the detector's first evaluation tick; a burst that finishes inside that
+tick reports its whole corpus, which is a late detection rather than a missing measurement.
+
+**The tuner re-fuses sampled signal values.** The ablation's scores are corrected from the
+alert lines in each run's log, so they are exact; the signal *vectors* come from polling
+`/api/verdicts`, so a peak the poller missed appears in the alert count but not in the vector.
+Weight tuning therefore sees a lower bound on the benign peaks, and its zero false-positive
+reading is a lower bound too.
+
+**One family.** The attack corpus is the controlled encryptor at three rates. Cross-family
+generalization has no second family to measure here, and `tune-weights.py` says so instead of
+simulating one.
+
+### What tuning found
+
+Nothing to change. A search over 101 weight vectors against the shipped table — maximising
+detection rate at the medium band under a 1% false-positive budget, with the held-out split
+reported beside the in-sample one — returns the shipped table unchanged, with leave-one-rate-out
+and leave-one-workload-out gaps of **+0.000**. The synthetic probe that masks one detection
+shows the tuned table winning in-sample and not out-of-sample, which is tuning bias and is
+reported as such. The useful result is negative: on this corpus the weight table is not the
+lever, and the ablation's differences come from which *signals exist*, not from how they are
+weighted.

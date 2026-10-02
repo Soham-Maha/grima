@@ -143,6 +143,10 @@ def parse_args() -> argparse.Namespace:
                          "needs longer gets longer")
     ap.add_argument("--warmup", default="15s", help="calibration window for calibrated subsets")
     ap.add_argument("--out", default="", help="results JSON (default: <work>/ablation.json)")
+    ap.add_argument("--merge", default="", help="start from this results JSON and replace only "
+                                               "the rows this run measures")
+    ap.add_argument("--reanalyse", default="", help="no runs: correct this results JSON from the "
+                                                    "runs' own logs and re-derive the metrics")
     ap.add_argument("--port", type=int, default=8798)
     ap.add_argument("--binary", default="")
     ap.add_argument("--python", default=sys.executable)
@@ -370,6 +374,18 @@ def warmup_workload(data: str, seconds: float) -> None:
         time.sleep(2)
 
 
+def to_posix(path: str) -> str:
+    """A Git-Bash-style path for a workload that runs under bash.
+
+    The harnesses hand workloads a POSIX path, and that matters: given `C:/...`,
+    a GNU-flavoured tar reads the drive letter as a remote host and archives
+    nothing, which makes the workload look silent because it wrote nothing.
+    """
+    if os.name == "nt" and len(path) > 2 and path[1] == ":":
+        return "/" + path[0].lower() + path[2:]
+    return path
+
+
 def scenario_env() -> dict:
     """Environment for a workload.
 
@@ -444,7 +460,7 @@ def one_run(args, binary: str, subset: str, scenario: str, kind: str, rnd: int) 
                          "--path", data, "--rate", scenario, "--seed", "7"]
     else:
         scenario_timeout = BENIGN_TIMEOUT
-        scenario_argv = [find_bash(), os.path.join(HERE, scenario), data]
+        scenario_argv = [find_bash(), os.path.join(HERE, scenario), to_posix(data)]
 
     write_config(config, data, baseline if calibrated else os.path.join(work, "absent.json"),
                  subset, calibrated, args.warmup)
@@ -617,6 +633,59 @@ def print_summary(summary: list[dict]) -> None:
           "— that is a late detection, not a missing measurement.")
 
 
+def log_peak_score(work: str) -> tuple[float, int]:
+    """The peak score and alert count from a run's own log.
+
+    Polling /api/verdicts every couple of seconds can miss the verdict that
+    alerted, so the sampled maximum under-counts detection — and an alert line
+    carries its score. Reading them back makes the detection rate exact instead
+    of sampled, which matters because the rate is computed from these numbers.
+    """
+    path = os.path.join(work, "grima.log")
+    peak, alerts = 0.0, 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "ransomware risk detected" not in line:
+                    continue
+                alerts += 1
+                for field in line.split():
+                    if field.startswith("score="):
+                        try:
+                            peak = max(peak, float(field.split("=", 1)[1]))
+                        except ValueError:
+                            pass
+    except OSError:
+        return 0.0, 0
+    return peak, alerts
+
+
+def reanalyse(rows: list[dict], work_root: str) -> list[dict]:
+    """Correct each row from its own log: the sampled verdict can miss the peak."""
+    for row in rows:
+        name = f"{row['subset'].replace('+', 'p')}-{row['scenario']}-r{row['round']}"
+        peak, alerts = log_peak_score(os.path.join(work_root, name))
+        if peak > row.get("max_score", 0.0):
+            row["max_score"] = round(peak, 1)
+        if alerts > row.get("alerts", 0):
+            row["alerts"] = alerts
+        if row.get("max_score", 0) >= 45:
+            row["max_level"] = "medium" if row["max_score"] < 70 else (
+                "high" if row["max_score"] < 88 else "critical")
+    return rows
+
+
+def merge_rows(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    """Replace rows by (subset, scenario, round), keeping everything else. Re-running
+    one workload must not mean re-running the matrix."""
+    key = lambda r: (r["subset"], r["scenario"], r["round"])
+    merged = {key(r): r for r in existing}
+    for row in incoming:
+        merged[key(row)] = row
+    return sorted(merged.values(), key=lambda r: (list(SUBSETS).index(r["subset"]),
+                                                  r["round"], r["scenario"]))
+
+
 def main() -> int:
     args = parse_args()
     if not args.work:
@@ -632,6 +701,20 @@ def main() -> int:
         sys.exit(f"error: unknown subset(s) {unknown}; known: {list(SUBSETS)}")
 
     CONFIG["port"] = args.port
+
+    if args.reanalyse:
+        with open(args.reanalyse, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        rows = reanalyse(data["rows"], args.work)
+        summary = summarise(rows)
+        print(f"re-analysed {len(rows)} row(s) from {args.work}")
+        print_summary(summary)
+        out = args.out or args.reanalyse
+        with open(out, "w", encoding="utf-8") as handle:
+            json.dump({"args": data.get("args", {}), "rows": rows, "summary": summary}, handle, indent=2)
+        print(f"\nresults: {out}")
+        return 0
+
     print(f"detector: {binary}")
     print(f"work root: {args.work}")
     print(f"subsets: {', '.join(subsets)}")
@@ -639,13 +722,23 @@ def main() -> int:
           f"{args.rounds} round(s), {int(args.duration)}s measured run each")
 
     rows: list[dict] = []
+    if args.merge:
+        with open(args.merge, "r", encoding="utf-8") as handle:
+            rows = json.load(handle)["rows"]
+        print(f"merging into {len(rows)} recorded row(s) from {args.merge}")
+    measured: list[dict] = []
     for subset in subsets:
         for rnd in range(1, args.rounds + 1):
             print(f"\n=== {subset} (round {rnd}) ===", flush=True)
             for rate in attacks:
-                rows.append(one_run(args, binary, subset, rate, "attack", rnd))
+                measured.append(one_run(args, binary, subset, rate, "attack", rnd))
             for workload in benign:
-                rows.append(one_run(args, binary, subset, workload, "benign", rnd))
+                measured.append(one_run(args, binary, subset, workload, "benign", rnd))
+
+    # Correct every row from its own log before deriving anything: the sampled
+    # verdict can miss the peak that alerted.
+    rows = merge_rows(rows, measured) if args.merge else measured
+    rows = reanalyse(rows, args.work)
 
     summary = summarise(rows)
     print_summary(summary)
