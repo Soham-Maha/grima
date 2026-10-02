@@ -23,10 +23,17 @@ func writeTree(t *testing.T, root string, dirs int) {
 	}
 }
 
-// A tree that is being written to while the watches are registered used to
-// deadlock Start: fsnotify's Add waits for its backend reader, and that reader
-// waits for the event channel to be drained by the consumer, which had not
-// started yet. The sensor stalled for minutes instead of failing.
+// A tree being written to while the watches are registered used to deadlock
+// Start: fsnotify's Add waits for its backend reader, and that reader waits for
+// a consumer that Start had not started yet. Once the reader's event buffer
+// fills, every remaining Add waits forever.
+//
+// Two details make this deterministic rather than flaky. The writes must arrive
+// *while* the walk runs — a burst made before Start can be coalesced by the OS
+// into fewer events than the buffer holds, and then nothing blocks. And the
+// writes must be bounded: with an unbounded writer the walk advances only as
+// fast as the consumer drains, which is correct but slow enough under -race to
+// look like the bug this test exists to catch.
 func TestStartReturnsWhileTheTreeIsBeingWritten(t *testing.T) {
 	dir := t.TempDir()
 	writeTree(t, dir, 300)
@@ -34,15 +41,10 @@ func TestStartReturnsWhileTheTreeIsBeingWritten(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	stop := make(chan struct{})
-	defer close(stop)
+	writing := make(chan struct{})
 	go func() {
-		for i := 0; ; i++ {
-			select {
-			case <-stop:
-				return
-			default:
-			}
+		defer close(writing)
+		for i := range 4000 {
 			_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("pkg-%03d", i%300), "lib", "index.js"),
 				[]byte(fmt.Sprintf("module.exports = %d\n", i)), 0o644)
 		}
@@ -58,12 +60,11 @@ func TestStartReturnsWhileTheTreeIsBeingWritten(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start: %v", err)
 		}
-	// The pre-fix failure mode is a deadlock, so it never returns at all; the
-	// budget only has to be long enough not to fail a slow machine under load.
 	case <-time.After(60 * time.Second):
 		t.Fatal("Start did not return while the tree was being written: the watch registration deadlocked")
 	}
 	defer src.Close()
+	<-writing
 
 	waitForEvent(t, out, "no event after Start returned")
 }
