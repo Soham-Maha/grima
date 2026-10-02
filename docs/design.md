@@ -714,11 +714,39 @@ detector.
 | `sensor.<name>.events` | Per-source event count | `/healthz` |
 | `sensor.<name>.errors` | Per-source error count | `/healthz` |
 | `watch.failures` | inotify watch exhaustion / RDCW overflow | `/healthz` |
+| `history.size` / `history.depth` | Verdicts held on the timeline | `/healthz`, dashboard |
+| `history.dropped` | Verdicts overwritten because the ring is full | `/healthz`, dashboard |
 | `calibration.ready` | Whether deviation signals are active | dashboard banner |
 | `calibration.age` | Time since baseline capture | dashboard |
 
 `/healthz` returns JSON. The dashboard shows a persistent banner while in uncalibrated
 mode, so an operator never mistakes "no alerts" for "calibrated and quiet."
+
+### The verdict history
+
+The dashboard is not a current-state view only: an incident that has already scrolled past
+must remain readable, or the operator sees a decaying score and no record of what happened.
+
+| Endpoint | Returns |
+|---|---|
+| `/api/verdicts` | The latest verdict per root, highest score first |
+| `/api/trees` | The same, grouped into trees with their contributing processes |
+| `/api/history` | `{entries, size, dropped, depth}` — recorded verdicts **oldest first**, each with its timestamp, level, score and signals |
+| `/events` | Server-sent events, one tree per message, for live updates |
+
+The history is a **bounded in-memory ring** (`historyDepth`, 4096 entries — tens of minutes
+at the default scoring cadence). It is deliberately not a database: this is a proof of
+concept, and a detector that grows without bound under a storm is the failure it exists to
+catch. When the ring wraps, the overwritten count is incremented and surfaced through
+`/healthz` and the payload, so a dashboard says "showing the last N, M overwritten" rather
+than implying the record is complete. This is the same rule as every other bounded queue in
+the system: **drops are counted, never silent.**
+
+It records the verdicts the detector **reports** — those with evidence or a level at or above
+`low` — not every scoring tick. A quiet host therefore contributes no points, and the timeline
+is a record of findings rather than a continuous score trace: an incident appears as a run of
+points and then stops, which is the moment the evidence left the window. Recording every tick
+instead would fill the ring in about an hour of idleness and bury the findings in noise.
 
 ---
 

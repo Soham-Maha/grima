@@ -128,10 +128,62 @@ func signalDTOs(signals []score.Signal) []signalDTO {
 	return out
 }
 
-// Hub keeps the latest verdict per process and fans them out to live listeners.
+// historyDepth bounds the verdict history the dashboard can show. One verdict is
+// recorded per root per scoring tick, so this is tens of minutes of activity at
+// the default cadence. It is bounded and counted: a dashboard must not be able to
+// grow the detector's memory, and a history that drops entries says so rather
+// than silently showing a gap.
+const historyDepth = 4096
+
+// historyDTO is one recorded verdict on the timeline: what the dashboard needs
+// to draw a point and, when it alerted, a feed entry. The member list is a count
+// here — a chart does not need every PID, and the tree view already carries them.
+type historyDTO struct {
+	At       time.Time   `json:"at"`
+	Root     int32       `json:"root"`
+	Name     string      `json:"proc_name"`
+	Level    string      `json:"level"`
+	Score    float64     `json:"score"`
+	Override string      `json:"override,omitempty"`
+	Signals  []signalDTO `json:"signals"`
+	Members  int         `json:"members"`
+}
+
+// historyPayload is the history endpoint's envelope. The counters travel with the
+// entries so a dashboard can say "showing the last N, M overwritten" instead of
+// implying the record is complete.
+type historyPayload struct {
+	Entries []historyDTO `json:"entries"`
+	Size    int          `json:"size"`
+	Dropped uint64       `json:"dropped"`
+	Depth   int          `json:"depth"`
+}
+
+func historyDTOs(verdicts []score.Verdict) []historyDTO {
+	out := make([]historyDTO, 0, len(verdicts))
+	for _, v := range verdicts {
+		out = append(out, historyDTO{
+			At:       v.EvaluatedAt,
+			Root:     v.PID,
+			Name:     v.ProcName,
+			Level:    v.Level.String(),
+			Score:    v.Score,
+			Override: v.Override,
+			Signals:  signalDTOs(v.Signals),
+			Members:  len(v.PIDs),
+		})
+	}
+	return out
+}
+
+// Hub keeps the latest verdict per process, a bounded history of recent
+// verdicts, and fans them out to live listeners.
 type Hub struct {
 	mu      sync.RWMutex
 	latest  map[int32]score.Verdict
+	history []score.Verdict
+	histPos int
+	dropped uint64
 	subs    map[int]chan score.Verdict
 	nextSub int
 	health  func() Health
@@ -140,9 +192,10 @@ type Hub struct {
 // NewHub returns a hub that reports health through the given function.
 func NewHub(health func() Health) *Hub {
 	return &Hub{
-		latest: make(map[int32]score.Verdict),
-		subs:   make(map[int]chan score.Verdict),
-		health: health,
+		latest:  make(map[int32]score.Verdict),
+		history: make([]score.Verdict, 0, historyDepth),
+		subs:    make(map[int]chan score.Verdict),
+		health:  health,
 	}
 }
 
@@ -151,6 +204,14 @@ func NewHub(health func() Health) *Hub {
 func (h *Hub) Publish(v score.Verdict) {
 	h.mu.Lock()
 	h.latest[v.PID] = v
+	if len(h.history) < historyDepth {
+		h.history = append(h.history, v)
+	} else {
+		// The ring is full: the oldest entry goes and the loss is counted.
+		h.history[h.histPos] = v
+		h.histPos = (h.histPos + 1) % historyDepth
+		h.dropped++
+	}
 	subs := make([]chan score.Verdict, 0, len(h.subs))
 	for _, ch := range h.subs {
 		subs = append(subs, ch)
@@ -163,6 +224,31 @@ func (h *Hub) Publish(v score.Verdict) {
 		default:
 		}
 	}
+}
+
+// History returns the recorded verdicts oldest first, so a chart can plot them
+// without reordering. The slice is a copy: a caller must not be able to mutate
+// what the hub is holding.
+func (h *Hub) History() []score.Verdict {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.history) < historyDepth {
+		return append([]score.Verdict(nil), h.history...)
+	}
+	out := make([]score.Verdict, 0, historyDepth)
+	out = append(out, h.history[h.histPos:]...)
+	out = append(out, h.history[:h.histPos]...)
+	return out
+}
+
+// HistoryStats reports how much of the history is in use and how many entries
+// have been overwritten, so a dashboard can show the gap rather than imply it
+// holds everything.
+func (h *Hub) HistoryStats() (size int, dropped uint64, depth int) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.history), h.dropped, historyDepth
 }
 
 // Latest returns recorded verdicts, highest score first.
@@ -219,6 +305,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/api/verdicts", s.verdicts)
 	mux.HandleFunc("/api/trees", s.trees)
+	mux.HandleFunc("/api/history", s.history)
 	mux.HandleFunc("/events", s.stream)
 
 	srv := &http.Server{
@@ -250,13 +337,36 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tmpl.Execute(w, map[string]any{
 		"Listen": s.cfg.Web.Listen,
+		// The dashboard marks a finding at the level an operator would be paged
+		// at, so it comes from the response policy rather than being hard-coded.
+		"AlertMin": s.cfg.Response.AlertMinLevel,
 	}); err != nil {
 		s.log.Warn("dashboard render failed", "error", err)
 	}
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, s.hub.health())
+	health := s.hub.health()
+	// The history is a bounded queue, so its drops belong where every other
+	// counter is read rather than only on the dashboard that consumes it.
+	if health.Extra == nil {
+		health.Extra = make(map[string]uint64)
+	}
+	size, dropped, depth := s.hub.HistoryStats()
+	health.Extra["history_size"] = uint64(size)
+	health.Extra["history_dropped"] = dropped
+	health.Extra["history_depth"] = uint64(depth)
+	writeJSON(w, health)
+}
+
+func (s *Server) history(w http.ResponseWriter, r *http.Request) {
+	size, dropped, depth := s.hub.HistoryStats()
+	writeJSON(w, historyPayload{
+		Entries: historyDTOs(s.hub.History()),
+		Size:    size,
+		Dropped: dropped,
+		Depth:   depth,
+	})
 }
 
 func (s *Server) verdicts(w http.ResponseWriter, r *http.Request) {
@@ -288,6 +398,14 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	// Open the stream before the first verdict arrives. A browser's EventSource
+	// only reports the connection once it sees response headers, so an idle
+	// detector would otherwise leave the dashboard unable to tell a live stream
+	// from a fallback poll.
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
 
 	ch, unsubscribe := s.hub.Subscribe()
 	defer unsubscribe()

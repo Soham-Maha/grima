@@ -8,9 +8,15 @@
   body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
          background: #14161a; color: #d8dee9; margin: 0; padding: 24px; }
   h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 13px; margin: 0 0 10px; color: #9aa5b1; font-weight: normal;
+       text-transform: uppercase; letter-spacing: 0.08em; }
   .sub { color: #7b8794; margin-bottom: 20px; }
+  .panel { margin: 0 0 26px; }
   .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px;
             background: #4a3a10; color: #ffd479; border: 1px solid #7a5c12; }
+  .note { padding: 7px 12px; border-radius: 6px; margin-bottom: 16px; font-size: 12px;
+          background: #1b1f26; color: #9aa5b1; border: 1px solid #262a31; }
+  .note.gap { background: #2a1c10; color: #ffbf7a; border-color: #7a4a12; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #262a31;
            vertical-align: top; }
@@ -29,9 +35,21 @@
   .inherited { opacity: 0.65; }
   .empty { color: #7b8794; padding: 20px 0; }
   footer { margin-top: 24px; color: #7b8794; font-size: 12px; }
+  .hint { color: #5c6672; font-size: 11px; font-weight: normal; text-transform: none;
+          letter-spacing: 0; margin-left: 8px; }
+  .chart { width: 100%; height: auto; display: block; }
+  .legend { margin-top: 8px; font-size: 12px; color: #7b8794; }
+  .legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+                margin: 0 5px 0 14px; vertical-align: middle; }
+  .legend .sw:first-child { margin-left: 0; }
+  .two { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 26px; }
+  @media (max-width: 900px) { .two { grid-template-columns: minmax(0, 1fr); } }
+  .bar { display: inline-block; height: 7px; background: #4a5b74; border-radius: 2px;
+         vertical-align: middle; min-width: 2px; }
+  .right { text-align: right; }
 </style>
 </head>
-<body>
+<body data-alert-min="{{.AlertMin}}" data-listen="{{.Listen}}">
   <h1>GRIMA</h1>
   <div class="sub">Adaptive multi-layer ransomware detection &mdash; live process risk</div>
 
@@ -40,91 +58,583 @@
     Override rules and absolute thresholds still apply.
   </div>
 
-  <table>
-    <thead>
-      <tr><th>PID</th><th>Process</th><th>Level</th><th>Score</th><th>Evidence</th></tr>
-    </thead>
-    <tbody id="rows">
-      <tr><td colspan="5" class="empty">Waiting for verdicts&hellip;</td></tr>
-    </tbody>
-  </table>
+  <div id="completeness" class="note">history: loading&hellip;</div>
+
+  <section class="panel">
+    <h2>Risk timeline
+      <span class="hint">one line per tree root &middot; points at each entry's level &middot; band lines at 20/45/70/88</span>
+    </h2>
+    <div id="chart"><div class="empty">No history yet.</div></div>
+    <div id="legend" class="legend"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Live process trees</h2>
+    <table>
+      <thead>
+        <tr><th>PID</th><th>Process</th><th>Level</th><th>Score</th><th>Evidence</th></tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="5" class="empty">Waiting for verdicts&hellip;</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <div class="two">
+    <section class="panel">
+      <h2>Findings <span id="feedCount" class="hint"></span></h2>
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Root</th><th>Level</th><th>Score</th><th>Signals</th></tr>
+        </thead>
+        <tbody id="feed">
+          <tr><td colspan="5" class="empty">No findings at or above the alert level.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Signals in window <span id="signalCount" class="hint"></span></h2>
+      <table>
+        <thead>
+          <tr><th>Signal</th><th>Findings</th><th>Highest</th><th></th></tr>
+        </thead>
+        <tbody id="signals">
+          <tr><td colspan="4" class="empty">No signals recorded.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
 
   <footer id="footer">connecting&hellip;</footer>
 
 <script>
-const rows = document.getElementById("rows");
+"use strict";
+
+// Level names and the band thresholds drawn as reference lines. The thresholds
+// mirror scoring.level_bands' defaults; the dashboard is a read-only view and
+// does not receive the config, so they are pinned here rather than guessed.
+const LEVEL_RANK = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+const LEVEL_COLOR = {
+  info: "#8b95a1", low: "#7ee2a8", medium: "#ffd479",
+  high: "#ff9f6e", critical: "#ff7b7b"
+};
+const BANDS = [
+  { name: "low", y: 20 }, { name: "medium", y: 45 },
+  { name: "high", y: 70 }, { name: "critical", y: 88 }
+];
+const SERIES_COLOR = ["#6ea8fe", "#c792ea", "#7ee2a8", "#ffd479", "#ff9f6e", "#ff7b7b"];
+
+// How many findings rows to render before saying "N hidden". The retained
+// history is bounded server-side; the feed is capped again so a long incident
+// cannot turn the page into a million DOM nodes.
+const FEED_CAP = 100;
+// Chart density: at most this many points per root. When the ring holds more
+// entries than this, entries are bucketed by time and each bucket contributes
+// its highest-scoring entry only — a spike is never averaged away, and the
+// thousands-of-entries case stays one polyline instead of a hairball.
+const MAX_POINTS = 180;
+
+const body = document.body;
+const ALERT_MIN = String(body.dataset.alertMin || "medium").toLowerCase();
+const ALERT_RANK = Object.prototype.hasOwnProperty.call(LEVEL_RANK, ALERT_MIN)
+  ? LEVEL_RANK[ALERT_MIN] : LEVEL_RANK.medium;
+
+const rowsEl = document.getElementById("rows");
 const banner = document.getElementById("banner");
 const footer = document.getElementById("footer");
+const chartEl = document.getElementById("chart");
+const legendEl = document.getElementById("legend");
+const feedEl = document.getElementById("feed");
+const feedCountEl = document.getElementById("feedCount");
+const signalsEl = document.getElementById("signals");
+const signalCountEl = document.getElementById("signalCount");
+const completenessEl = document.getElementById("completeness");
+
 const trees = new Map();
+const state = {
+  history: [],        // oldest first, exactly what the chart plots
+  size: 0,            // entries the server is retaining
+  dropped: 0,         // entries the ring overwrote
+  depth: 4096,        // ring capacity
+  skewMs: 0,          // server clock minus browser clock, so appended points line up
+  live: false,        // whether /events is currently connected
+  streamDown: false   // whether the event stream has errored and polling took over
+};
+
+// The footer composes health and connection state, so a health failure cannot
+// overwrite the "fell back to polling" notice — the operator must be able to see
+// both that the stream is down and why the numbers are stale.
+let healthText = "health connecting\u2026";
+let pollError = "";
+
+function connectionText() {
+  if (state.live) return "live stream (/events)";
+  if (state.streamDown) return "live stream (/events) dropped \u2014 falling back to polling /api/history every 5s";
+  return "connecting\u2026";
+}
+
+function renderFooter() {
+  footer.textContent = healthText + " \u00b7 " + connectionText() + (pollError ? " \u00b7 " + pollError : "");
+}
+
+// --- small helpers ---------------------------------------------------------
+
+function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : (d === undefined ? 0 : d); }
+
+function esc(v) {
+  return String(v === undefined || v === null ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function rank(level) {
+  return Object.prototype.hasOwnProperty.call(LEVEL_RANK, level) ? LEVEL_RANK[level] : -1;
+}
+
+function pad(n) { return String(n).padStart(2, "0"); }
+
+function fmtTime(at) {
+  const t = Date.parse(at);
+  if (Number.isNaN(t)) return "&mdash;";
+  const d = new Date(t);
+  return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+}
+
+function badge(level) {
+  const lv = Object.prototype.hasOwnProperty.call(LEVEL_RANK, level) ? level : "info";
+  return '<span class="lvl ' + lv + '">' + esc(lv) + "</span>";
+}
+
+// --- history bookkeeping ---------------------------------------------------
+
+// setHistory replaces the whole window from /api/history. Appends from /events
+// must not use this, or a long-lived page would duplicate every entry.
+function setHistory(entries, size, dropped, depth) {
+  const list = Array.isArray(entries) ? entries : [];
+  state.history = list.slice();
+  if (Number.isFinite(size)) state.size = size;
+  else state.size = state.history.length;
+  if (Number.isFinite(dropped)) state.dropped = dropped;
+  if (Number.isFinite(depth) && depth > 0) state.depth = depth;
+  if (state.history.length) {
+    const last = Date.parse(state.history[state.history.length - 1].at);
+    if (!Number.isNaN(last)) state.skewMs = Date.now() - last;
+  }
+}
+
+// appendHistory adds one verdict from the live stream, timestamped on the
+// server's clock (the last history timestamp plus the elapsed browser time) so
+// the point lands in the right place on a timeline built from server times.
+function appendHistory(entry) {
+  const at = Date.now() - state.skewMs;
+  entry.at = new Date(at).toISOString();
+  state.history.push(entry);
+  // Mirror the ring's bound locally too, so a page open for days does not grow.
+  if (state.history.length > state.depth) {
+    state.history.splice(0, state.history.length - state.depth);
+  }
+  state.size = Math.max(state.size, state.history.length);
+}
+
+function treeToEntry(t) {
+  return {
+    root: num(t.root, -1),
+    proc_name: t.proc_name || "(unattributed)",
+    level: t.level || "info",
+    score: num(t.score),
+    override: t.override || "",
+    signals: Array.isArray(t.signals) ? t.signals : [],
+    members: (Array.isArray(t.members) ? t.members.length : 0) + 1
+  };
+}
+
+function findings() {
+  return state.history.filter(e => rank(e.level) >= ALERT_RANK);
+}
+
+// --- timeline chart --------------------------------------------------------
+
+function drawChart() {
+  const entries = state.history;
+  if (!entries.length) {
+    chartEl.innerHTML = '<div class="empty">No history yet.</div>';
+    legendEl.textContent = "";
+    return;
+  }
+
+  const W = 900, H = 260;
+  const PAD = { l: 40, r: 14, t: 12, b: 26 };
+  const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+  const yFor = s => PAD.t + plotH * (1 - Math.max(0, Math.min(100, num(s))) / 100);
+
+  const times = [];
+  for (const e of entries) {
+    const t = Date.parse(e.at);
+    if (!Number.isNaN(t)) times.push(t);
+  }
+  const tMin = times.length ? Math.min.apply(null, times) : 0;
+  const tMax = times.length ? Math.max.apply(null, times) : 0;
+  const span = tMax - tMin;
+
+  const xFor = (e, i, n) => {
+    const t = Date.parse(e.at);
+    if (span > 0 && !Number.isNaN(t)) return PAD.l + (t - tMin) / span * plotW;
+    return PAD.l + (n <= 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+  };
+
+  // Group by root, keeping first-seen order so the legend is stable.
+  const order = [], byRoot = new Map();
+  for (const e of entries) {
+    if (!byRoot.has(e.root)) { byRoot.set(e.root, []); order.push(e.root); }
+    byRoot.get(e.root).push(e);
+  }
+
+  // Downsample when needed: one point per time bucket, the bucket's highest
+  // score, so a burst shows its peak rather than a smoothed-over average.
+  const series = [];
+  for (let k = 0; k < order.length; k++) {
+    const root = order[k];
+    const list = byRoot.get(root);
+    const n = list.length;
+    const pts = [];
+    if (n <= MAX_POINTS) {
+      for (let i = 0; i < n; i++) pts.push(point(list[i], xFor(list[i], i, n), yFor));
+    } else {
+      const buckets = [];
+      for (let i = 0; i < n; i++) {
+        const t = Date.parse(list[i].at);
+        const b = span > 0 && !Number.isNaN(t)
+          ? Math.min(MAX_POINTS - 1, Math.floor((t - tMin) / span * MAX_POINTS))
+          : Math.floor(i * MAX_POINTS / n);
+        if (!buckets[b] || num(list[i].score) > num(buckets[b].score)) buckets[b] = { e: list[i], i: i };
+      }
+      for (let b = 0; b < buckets.length; b++) {
+        const hit = buckets[b];
+        if (!hit) continue;
+        pts.push(point(hit.e, xFor(hit.e, hit.i, n), yFor));
+      }
+    }
+    series.push({
+      root: root,
+      name: (list[n - 1] && list[n - 1].proc_name) || "(unattributed)",
+      color: SERIES_COLOR[k % SERIES_COLOR.length],
+      points: pts
+    });
+  }
+
+  const parts = [];
+  parts.push('<svg class="chart" viewBox="0 0 ' + W + " " + H +
+    '" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Risk score over time">');
+
+  // Level bands as reference lines, with their thresholds on the y axis.
+  for (const band of BANDS) {
+    const yy = yFor(band.y).toFixed(1);
+    parts.push('<line x1="' + PAD.l + '" y1="' + yy + '" x2="' + (W - PAD.r) + '" y2="' + yy +
+      '" stroke="#2a2f38" stroke-dasharray="3 4"/>');
+    parts.push('<text x="' + (PAD.l - 6) + '" y="' + (num(yy) + 4) +
+      '" fill="#7b8794" font-size="10" text-anchor="end">' + band.y + "</text>");
+    parts.push('<text x="' + (W - PAD.r) + '" y="' + (num(yy) - 3) +
+      '" fill="#3f4650" font-size="9" text-anchor="end">' + band.name + "</text>");
+  }
+  parts.push('<text x="' + (PAD.l - 6) + '" y="' + (PAD.t + 4) +
+    '" fill="#4b5561" font-size="10" text-anchor="end">100</text>');
+  parts.push('<text x="' + (PAD.l - 6) + '" y="' + (PAD.t + plotH + 4) +
+    '" fill="#4b5561" font-size="10" text-anchor="end">0</text>');
+
+  // Time axis: gridlines and labels at the ends and the middle.
+  const ticks = span > 0
+    ? [0, 0.5, 1].map(f => ({ x: PAD.l + f * plotW, t: tMin + f * span }))
+    : [{ x: PAD.l + plotW / 2, t: tMin }];
+  parts.push('<line x1="' + PAD.l + '" y1="' + (PAD.t + plotH) + '" x2="' + (W - PAD.r) + '" y2="' +
+    (PAD.t + plotH) + '" stroke="#262a31"/>');
+  for (const tick of ticks) {
+    parts.push('<line x1="' + tick.x.toFixed(1) + '" y1="' + PAD.t + '" x2="' + tick.x.toFixed(1) +
+      '" y2="' + (PAD.t + plotH) + '" stroke="#1d2026"/>');
+    parts.push('<text x="' + tick.x.toFixed(1) + '" y="' + (H - 8) +
+      '" fill="#7b8794" font-size="10" text-anchor="middle">' + fmtTime(new Date(tick.t).toISOString()) + "</text>");
+  }
+
+  for (const s of series) {
+    if (s.points.length > 1) {
+      const d = s.points.map(p => p.x.toFixed(1) + "," + p.y.toFixed(1)).join(" ");
+      parts.push('<polyline fill="none" stroke="' + s.color + '" stroke-width="1.5" points="' + d + '"/>');
+    }
+    for (const p of s.points) {
+      const col = LEVEL_COLOR[p.level] || LEVEL_COLOR.info;
+      const r = p.alert ? 3.4 : 2.4;
+      parts.push('<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="' + r +
+        '" fill="' + col + '" stroke="#14161a" stroke-width="0.8"><title>' +
+        esc(p.level + " " + num(p.score).toFixed(1) + " — " + p.time) + "</title></circle>");
+    }
+  }
+  parts.push("</svg>");
+  chartEl.innerHTML = parts.join("");
+
+  const legend = series.map(s =>
+    '<span class="sw" style="background:' + s.color + '"></span>root ' + esc(s.root) +
+    " " + esc(s.name)).join("");
+  const levels = Object.keys(LEVEL_RANK).map(lv =>
+    '<span class="sw" style="background:' + LEVEL_COLOR[lv] + '"></span>' + esc(lv)).join("");
+  legendEl.innerHTML = legend + '<span style="margin-left:18px">' + levels + "</span>";
+}
+
+function point(e, x, yFor) {
+  return {
+    x: x, y: yFor(e.score), score: num(e.score), level: e.level || "info",
+    alert: rank(e.level) >= ALERT_RANK, time: e.at
+  };
+}
+
+// --- findings feed ---------------------------------------------------------
+
+function renderFeed() {
+  const found = findings();          // oldest first
+  const newest = found.slice().reverse();
+  const shown = newest.slice(0, FEED_CAP);
+  if (!shown.length) {
+    feedEl.innerHTML = '<tr><td colspan="5" class="empty">No findings at or above ' +
+      esc(ALERT_MIN) + " in the retained window.</td></tr>";
+    feedCountEl.textContent = "";
+    return;
+  }
+  feedEl.innerHTML = shown.map(e => {
+    const details = (Array.isArray(e.signals) ? e.signals : [])
+      .map(s => esc(s && s.detail ? s.detail : (s && s.name ? s.name : "")))
+      .filter(Boolean).join("<br>");
+    const override = e.override ? '<div class="sig">override: ' + esc(e.override) + "</div>" : "";
+    return '<tr><td class="sig">' + fmtTime(e.at) + "</td>" +
+      "<td>" + esc(e.root) + " " + esc(e.proc_name || "(unattributed)") + "</td>" +
+      "<td>" + badge(e.level) + "</td>" +
+      '<td class="right">' + num(e.score).toFixed(1) + "</td>" +
+      '<td class="sig">' + (details || "&mdash;") + override + "</td></tr>";
+  }).join("");
+  const hidden = newest.length - shown.length;
+  feedCountEl.textContent = "showing " + shown.length + " of " + newest.length +
+    (hidden > 0 ? " (" + hidden + " hidden)" : "");
+}
+
+// --- signal panel ----------------------------------------------------------
+
+function renderSignals() {
+  const found = findings();
+  const stats = new Map();
+  for (const e of found) {
+    for (const s of (Array.isArray(e.signals) ? e.signals : [])) {
+      const name = (s && s.name) || "(unnamed)";
+      const st = stats.get(name) || { name: name, count: 0, max: 0 };
+      st.count++;
+      const v = num(s && s.value);
+      if (v > st.max) st.max = v;
+      stats.set(name, st);
+    }
+  }
+  const list = Array.from(stats.values())
+    .sort((a, b) => b.count - a.count || b.max - a.max);
+  if (!list.length) {
+    signalsEl.innerHTML = '<tr><td colspan="4" class="empty">No signals in the alert window.</td></tr>';
+    signalCountEl.textContent = "";
+    return;
+  }
+  signalsEl.innerHTML = list.map(s =>
+    "<tr><td>" + esc(s.name) + '</td><td class="right">' + s.count + "</td>" +
+    '<td class="right">' + s.max.toFixed(2) + "</td>" +
+    '<td><span class="bar" style="width:' + Math.round(Math.max(0, Math.min(1, s.max)) * 60) +
+    'px"></span></td></tr>').join("");
+  signalCountEl.textContent = "over " + found.length + " finding" + (found.length === 1 ? "" : "s");
+}
+
+// --- completeness ----------------------------------------------------------
+
+function renderCompleteness() {
+  const n = state.size || state.history.length;
+  if (state.dropped > 0) {
+    completenessEl.className = "note gap";
+    completenessEl.textContent = "showing the last " + n + " retained verdicts, " +
+      state.dropped + " older overwritten (ring of " + state.depth +
+      ") — the chart does not hold everything";
+  } else {
+    completenessEl.className = "note";
+    completenessEl.textContent = "history complete for this run: " + n + " verdict" +
+      (n === 1 ? "" : "s") + " retained (ring of " + state.depth + "), none overwritten";
+  }
+}
+
+// --- tree table (unchanged view) ------------------------------------------
 
 function memberRows(members) {
   return members.map(m => {
-    const dim = m.own ? "" : " inherited";
-    const note = m.own ? "own verdict" : "contributes to the tree aggregate";
-    return `<tr>
-      <td${dim ? ` class="inherited"` : ""}>${m.pid}</td>
-      <td class="sig">&mdash;</td>
-      <td><span class="lvl ${m.level}${dim}">${m.level}</span></td>
-      <td${dim ? ` class="inherited"` : ""}>${m.score.toFixed(1)}</td>
-      <td class="sig">${note}</td>
-    </tr>`;
+    const own = !!m.own;
+    const dim = own ? "" : " inherited";
+    const note = own ? "own verdict" : "contributes to the tree aggregate";
+    return "<tr>" +
+      "<td" + (dim ? ' class="inherited"' : "") + ">" + esc(num(m.pid, "?")) + "</td>" +
+      '<td class="sig">&mdash;</td>' +
+      "<td>" + badge(m.level) + "</td>" +
+      "<td" + (dim ? ' class="inherited"' : "") + ">" + num(m.score).toFixed(1) + "</td>" +
+      '<td class="sig">' + note + "</td></tr>";
   }).join("");
 }
 
 function treeRow(t) {
-  const evidence = (t.signals || [])
-    .map(s => `${s.name}: ${s.detail}`)
+  const evidence = (Array.isArray(t.signals) ? t.signals : [])
+    .map(s => esc(s && s.name ? s.name : "signal") + ": " + esc(s && s.detail ? s.detail : ""))
     .join("<br>");
-  const members = t.members || [];
-  const count = members.length ? `<span class="count">${members.length + 1} procs</span>` : "";
-  const head = `<tr>
-      <td>${t.root}</td>
-      <td>${t.proc_name || "(unattributed)"}${count}</td>
-      <td><span class="lvl ${t.level}">${t.level}</span></td>
-      <td>${t.score.toFixed(1)}</td>
-      <td class="sig">${evidence || "&mdash;"}</td>
-    </tr>`;
+  const members = Array.isArray(t.members) ? t.members : [];
+  const count = members.length ? '<span class="count">' + (members.length + 1) + " procs</span>" : "";
+  const head = "<tr>" +
+    "<td>" + esc(num(t.root, "?")) + "</td>" +
+    "<td>" + esc(t.proc_name || "(unattributed)") + count + "</td>" +
+    "<td>" + badge(t.level) + "</td>" +
+    '<td class="right">' + num(t.score).toFixed(1) + "</td>" +
+    '<td class="sig">' + (evidence || "&mdash;") + "</td></tr>";
   if (members.length === 0) return head;  // a lone process renders exactly like a flat row
-  return head + `<tr><td colspan="5">
-      <details><summary>${members.length} contributing process${members.length === 1 ? "" : "es"}</summary>
-        <table class="members"><tbody>${memberRows(members)}</tbody></table>
-      </details></td></tr>`;
+  return head + '<tr><td colspan="5"><details><summary>' + members.length +
+    " contributing process" + (members.length === 1 ? "" : "es") + "</summary>" +
+    '<table class="members"><tbody>' + memberRows(members) + "</tbody></table></details></td></tr>";
 }
 
-function render() {
-  const list = [...trees.values()].sort((a, b) => b.score - a.score);
+function renderTrees() {
+  const list = Array.from(trees.values()).sort((a, b) => num(b.score) - num(a.score));
   if (list.length === 0) return;
-  rows.innerHTML = list.map(treeRow).join("");
+  rowsEl.innerHTML = list.map(treeRow).join("");
+}
+
+// --- rendering scheduler ---------------------------------------------------
+
+let redrawTimer = 0;
+function scheduleRedraw() {
+  if (redrawTimer) return;
+  redrawTimer = setTimeout(() => {
+    redrawTimer = 0;
+    drawChart();
+    renderFeed();
+    renderSignals();
+    renderCompleteness();
+  }, 200);
+}
+
+// --- data sources ----------------------------------------------------------
+
+async function fetchJSON(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(url + " -> " + res.status);
+  return res.json();
+}
+
+async function loadHistory() {
+  const payload = await fetchJSON("/api/history");
+  setHistory(payload && payload.entries, num(payload && payload.size, 0),
+    num(payload && payload.dropped, 0), num(payload && payload.depth, 4096));
+}
+
+async function loadTrees() {
+  const list = await fetchJSON("/api/trees");
+  (Array.isArray(list) ? list : []).forEach(t => {
+    if (t && t.root !== undefined) trees.set(t.root, t);
+  });
 }
 
 async function refreshHealth() {
   try {
-    const h = await (await fetch("/healthz")).json();
-    banner.hidden = h.calibration_ready;
-    footer.textContent =
-      `published ${h.bus_published} · dropped ${h.bus_dropped} · ` +
-      `processes ${h.live_processes} · uptime ${Math.round(h.uptime_seconds)}s`;
-  } catch (e) {
-    footer.textContent = "health unavailable";
+    const h = await fetchJSON("/healthz");
+    banner.hidden = !!h.calibration_ready;
+    const extra = h.extra || {};
+    if (extra.history_dropped !== undefined) state.dropped = num(extra.history_dropped);
+    if (extra.history_depth !== undefined) state.depth = num(extra.history_depth, state.depth);
+    if (extra.history_size !== undefined) state.size = Math.max(num(extra.history_size), state.history.length);
+    const listen = body.dataset.listen || "";
+    healthText = "published " + num(h.bus_published) + " · dropped " + num(h.bus_dropped) +
+      " · processes " + num(h.live_processes) + " · uptime " + Math.round(num(h.uptime_seconds)) + "s" +
+      (listen ? " · " + listen : "");
+    renderFooter();
+    renderCompleteness();
+  } catch (err) {
+    healthText = "health unavailable";
+    renderFooter();
   }
 }
 
-fetch("/api/trees").then(r => r.json()).then(list => {
-  (list || []).forEach(t => trees.set(t.root, t));
-  render();
-});
+let pollTimer = 0;
 
-const events = new EventSource("/events");
-events.onmessage = e => {
-  const t = JSON.parse(e.data);
-  if (t && t.root !== undefined) {
-    trees.set(t.root, t);
-    render();
+// Polling is the fallback when the event stream is down, not the primary path:
+// it replaces the whole window, so a dead stream is visible in the UI rather
+// than silently freezing the page.
+async function poll() {
+  try {
+    await loadHistory();
+    await loadTrees();
+    pollError = "";
+    renderTrees();
+    scheduleRedraw();
+  } catch (err) {
+    pollError = "/api/history unreachable: " + err.message;
   }
-};
+  renderFooter();
+}
 
-refreshHealth();
-setInterval(refreshHealth, 5000);
+function startPolling() {
+  if (pollTimer) return;
+  poll();
+  pollTimer = setInterval(poll, 5000);
+}
+
+function stopPolling() {
+  if (!pollTimer) return;
+  clearInterval(pollTimer);
+  pollTimer = 0;
+}
+
+function connectStream() {
+  const events = new EventSource("/events");
+  events.onopen = () => {
+    state.live = true;
+    state.streamDown = false;
+    pollError = "";
+    stopPolling();
+    renderFooter();
+    // A server that restarted while the stream was down has a different window,
+    // so replace it rather than appending onto a stale chart.
+    loadHistory()
+      .then(() => loadTrees())
+      .then(renderTrees)
+      .catch(() => {})
+      .then(scheduleRedraw);
+    refreshHealth();
+  };
+  events.onmessage = ev => {
+    let t;
+    try { t = JSON.parse(ev.data); } catch (err) { return; }
+    if (!t || t.root === undefined) return;
+    trees.set(t.root, t);
+    appendHistory(treeToEntry(t));
+    renderTrees();
+    scheduleRedraw();
+  };
+  // EventSource reconnects on its own; while it is down we poll, and say so.
+  events.onerror = () => {
+    state.live = false;
+    state.streamDown = true;
+    startPolling();
+    renderFooter();
+  };
+}
+
+// --- boot ------------------------------------------------------------------
+
+(async function boot() {
+  try {
+    await loadHistory();
+    await loadTrees();
+    renderTrees();
+    scheduleRedraw();
+  } catch (err) {
+    chartEl.innerHTML = '<div class="empty">Could not load /api/history: ' + esc(err.message) + "</div>";
+  }
+  connectStream();
+  refreshHealth();
+  setInterval(refreshHealth, 5000);
+})();
 </script>
 </body>
 </html>

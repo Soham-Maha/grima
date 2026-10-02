@@ -143,6 +143,7 @@ window into the existing baseline rather than starting over:
 | `/healthz` | The honest counters — `calibration_ready`, `bus_published`/`bus_dropped`, and per sensor `Events`, `Dropped`, `watch_failures`, `add_pending` |
 | `/api/verdicts` | The current verdicts as JSON, with the signals and values behind each one |
 | `/api/trees` | Verdicts grouped by tree root with their contributing processes |
+| `/api/history` | The recorded verdict history, oldest first — the timeline and findings the dashboard draws. Bounded in memory, with the overwritten count beside it |
 | `/events` | Server-sent events stream of new verdicts |
 
 Alerts also go to the log as one line each:
