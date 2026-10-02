@@ -39,6 +39,12 @@ go.work.sum
 grima-baseline.json
 *-baseline.json
 
+# Local run: the one-command launcher, its config and its watched directory are
+# machine specific. Recreate the launcher from the README's PowerShell section.
+/run-grima.ps1
+/grima.toml
+/grima-demo/
+
 # Run output
 *.log
 
