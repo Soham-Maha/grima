@@ -31,6 +31,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 22. [The `max_delay` Curve, and a Coupling It Exposed](#22-the-max_delay-curve-and-a-coupling-it-exposed)
 23. [Sprint 2 Close-Out: An Amended Criterion, Four Harness Defects, One Deadlock](#23-sprint-2-close-out-an-amended-criterion-four-harness-defects-one-deadlock)
 24. [The Cerberus Split: What Is Asserted, and What Is Only Measured](#24-the-cerberus-split-what-is-asserted-and-what-is-only-measured)
+25. [Startup Has No Bound Under Load — Proposed Design Change](#25-startup-has-no-bound-under-load--proposed-design-change)
 
 ---
 
@@ -255,8 +256,10 @@ switch that did nothing, and 3.3 found that the live per-process measurement can
 asserted on this host at all.
 
 **Also landed, unplanned.** §23's `filewatch` deadlock fix is the largest single change in
-this sprint: a startup that could hang for minutes on a tree that was being written to, now
-bounded and covered by a regression test that fails on the pre-fix code.
+this sprint: a startup that could hang for minutes on a tree that was being written to is now
+gone, covered by a regression test that fails on the pre-fix code. It is not the whole story —
+§25 records what the fix left behind, a startup whose *rate* is still coupled to the event
+drain, and proposes the change that would bound it.
 
 ---
 
@@ -279,6 +282,7 @@ bounded and covered by a regression test that fails on the pre-fix code.
 | 4.11 | **Re-run the signal measurements** | W3 | §17 and §18 rest on scratch programs under `.sprint2/FingerprintWork/`. Re-run them from the ablation harness so the numbers are reproducible from the repo, not from one agent's scratch dir |
 | 4.12 | **Report per-round spread** | W3 | Carried from 2.10. One scenario scored 100 and 56.4 for a purely environmental reason — no single-run figure is trustworthy |
 | 4.13 | **Measure the split under causal attribution** | W3 | Carried from 3.3. The live per-process half of the split claim cannot be asserted while the writer is a guess: two runs under `correlate` landed the evidence in `explorer.exe`'s tree (§24). Re-run `cerberus.sh correlate` with `attribution.mode = "audit"` on an elevated host, where the writer is OS-reported, and record the tree-versus-children numbers there |
+| 4.14 | **Bound `FileWatch` startup** | W1 | Carried from 3.6/§25. `Start` walks every directory before returning, so a large tree under load delays every other sensor and the score loop, and `design.md` §3.1 already promises `Start` returns once the source is *observing*. Add `filewatch.startup_deadline` (default 10 s), queue the remainder to the worker, count it as `add_pending`, and update `design.md` §3.1 and §13 in the same change. Blocked on the `plan.md` §11 decision |
 
 **Safety, non-negotiable for 4.2:** isolated VM, snapshots, host-only network, no shared
 folders, Defender exclusions inside the test VM only. Prefer the simulator for the demo.
@@ -1771,3 +1775,70 @@ needs elevation. It is carried into Sprint 4 as item 4.13.
 `cerberus.sh correlate` is therefore a characterisation phase: it prints which root carried
 the crossing and whether that root was the workload's own, and it does not fail the run.
 Asserting a stable outcome there would be asserting a coin flip.
+
+---
+
+## 25. Startup Has No Bound Under Load — Proposed Design Change
+
+### What the deadlock fix left behind
+
+§23 removed a hang: the consumer now starts before the first watch is added, and directories
+discovered at runtime are queued rather than registered on the event loop. What remains is a
+**rate coupling**, and it only shows up under load.
+
+| Shape | `Start` returns in |
+|---|---|
+| Pre-fix, 300-directory tree, writer running | never — the deadlock §23 describes |
+| Post-fix, same shape, uninstrumented | **8–11 s** |
+| Post-fix, same shape, under `-race` | **past 60 s** |
+
+The goroutine dump says nothing is stuck: fsnotify's `readEvents` is blocked in `sendEvent`
+on a full 128-event channel, our loop is inside `readSample` doing its work, and the walk's
+`Add` is waiting behind the queue. The walk advances at the consumer's drain rate, so a
+writer that outruns the consumer stretches startup for as long as it keeps writing.
+
+### Why this is a conformance problem, not just a slow path
+
+`docs/design.md` §3 contract 1 already says: *"`Start` returns once the source is observing,
+not when it finishes. It must not block for the lifetime of the process."* The implementation
+walks every directory before returning, so on a large tree under load it returns when the
+**walk** finishes, not when the source is observing. The code disagrees with the
+specification, and by this repo's rule that makes the code the bug.
+
+The cost is not confined to one sensor: `app.startSensors` starts sources in sequence and the
+score loop starts only after all of them, so a slow `filewatch` walk delays `procwatch`,
+`persistwatch` and every verdict — the detector is blind for as long as the walk takes.
+
+### Proposed change
+
+Bound the walk, keep what is watched, queue the remainder.
+
+- `filewatch.Start` walks with a deadline: `filewatch.startup_deadline`, default **10 s**,
+  `0` meaning unbounded (today's behaviour).
+- On expiry: log how many directories are watched and how many remain, hand the remainder to
+  the existing `addWorker` queue, and return.
+- Contract 4 still holds: if **nothing** is watched when the deadline expires, return the
+  error and be skipped — the detector never starts blind.
+- Two counters in `/healthz`: `add_pending` (queued, not yet registered) next to the existing
+  `add_dropped`.
+- `design.md` §3 contract 1 gains one sentence: *observing* means at least one monitored root
+  is watched; the remainder may be registered after `Start` returns, and a directory whose
+  watch has not landed yet is covered by the overflow rescan until it does.
+
+**Rejected alternatives.**
+
+- *Register watches without fsnotify's handshake.* Not possible: `Add` always handshakes with
+  the backend reader, which is the mechanism §23 is about.
+- *Document the bound and change nothing.* Cheapest, no interface change, but it leaves the
+  worst case unbounded in principle and leaves `Start` non-conforming to its own contract.
+- *Persist a watch list between runs.* The list goes stale, and a stale watch is worse than a
+  late one — it looks like coverage that is not there.
+
+**Acceptance criteria, if adopted.** A test that a tree larger than the deadline returns
+within the deadline plus a margin with the remainder counted; the §23 deadlock regression
+still failing on pre-fix code; a measurement that `add_pending` reaches zero once the workload
+stops; `design.md` §3.1 and §13 updated in the same change.
+
+**Cost.** Around half a day, most of it the "returns early and the tree still completes" test.
+
+**Status.** Open — recorded in `plan.md` §11 as a decision, and queued as Sprint 4 item 4.14.

@@ -337,3 +337,4 @@ grima/
 | 4 | **Response default.** Observe-only in v1. Auto-suspend requires an FPR measurement first. | Settled (observe) |
 | 5 | **macOS sensor set.** Phase 7, not Phase 0. | Settled (Phase 7) |
 | 6 | **Whether the course expects an ML component.** The design is ML-free by choice; if the course rubric requires ML, that is a conversation to have before Phase 3. | Open — external |
+| 7 | **Bounding `FileWatch` startup.** `Start` walks every monitored directory before returning, so a large tree under load delays the whole detector — and `design.md` §3.1 already promises it returns "once the source is observing". Proposed: a `filewatch.startup_deadline` (default 10 s) after which the remainder is queued to the worker and counted in `/healthz`. Measured worst case today: 8–11 s for 300 directories against a writer in a tight loop, past 60 s under `-race`; see `sprints.md` §25. | Open — needs a call, queued as 4.14 |
