@@ -222,6 +222,25 @@ func renameBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowS
 // unknownExtensionSignal counts writes to extensions this host has never seen,
 // which is how a mass rename to a new suffix (".locked") shows up. It is
 // cumulative, so it survives the decaying window.
+//
+// Decision (Sprint 4, item 4.10): the alert is accepted, not floored.
+//
+// Measured with the shipped weights and bands (internal/score/alertability_test.go):
+// 10 novel-extension writes score 20.0 info, 20 score 40.0 low, 30 score 60.0
+// medium, 50 score 100.0 critical. So the medium band is crossed at 23 novel
+// writes and a first-time workload whose extensions calibration never learned can
+// page an operator with no burst. That is the accepted cost: at most one alert
+// per genuinely new extension set, until recalibration promotes the extensions
+// (promotion is absolute, so the second run is silent).
+//
+// A minimum-novelty floor was rejected because it breaks the design's answer to
+// Gap 4 instead of the benign case. The quiet drip (item 2.2) writes 24 files of
+// an unseen extension in a window with no other evidence and carries the verdict
+// as this signal at 0.480 plus cum_bytes_rewritten at 0.094 — measured at 49.96
+// medium, i.e. it crosses by 5 points. Moving the alert point above 30 files
+// needs the saturation count to exceed 30/0.45 = 66.7; at 67 the same pair fuses
+// to 0.382 (38.2 low) and quiet drip stops alerting. The floor and the
+// capability are the same constant, so the constant stays at 50.
 func unknownExtensionSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (Signal, bool) {
 	var unknown int64
 	for ext, n := range tv.ExtActivity {

@@ -217,8 +217,8 @@ package score
 type Class uint8
 
 const (
-    ClassPrimary   Class = iota // contributes to weighted sum
-    ClassSecondary              // contributes with lower weight
+    ClassPrimary   Class = iota // carries a verdict on its own
+    ClassSecondary              // corroborates: fuses only alongside a Primary
     ClassOverride               // sets a floor, never averaged
 )
 
@@ -511,7 +511,9 @@ func (s *Scorer) Evaluate(tv fingerprint.TreeVector, b *calibrate.Baseline) Verd
 
 1. **Independent evidence, not an average.** Signals combine as
    $\text{score} = 100 \left(1 - \prod_i \left(1 - \mathrm{clamp}_{[0,1]}(w_i \cdot v_i)\right)\right)$
-   over Primary and Secondary signals, where $w_i$ comes from configuration.
+   over Primary and Secondary signals, where $w_i$ comes from configuration. The product
+   is taken over every Primary signal, and over Secondary signals **only while at least one
+   Primary is present**; Secondary-only evidence is reported in `Signals` but does not fuse.
 
    This is noisy-OR, and the choice is deliberate. A weighted mean is **not monotonic**:
    adding a weak signal lowers the score, so a saturated signal alone scored 100 while the
@@ -519,6 +521,12 @@ func (s *Scorer) Evaluate(tv fingerprint.TreeVector, b *calibrate.Baseline) Verd
    reading as less severe. That is not a hypothetical: it is the difference between a local
    run and CI on an identical scenario (`sprints.md` §15). A risk score must be monotonic in
    its evidence, so evidence can only add.
+
+   The corroboration gate is structural, not arithmetic (`sprints.md` §18, Sprint 4 item
+   4.9). A Secondary may not carry a verdict: bounding each Secondary's weight below the band
+   leaves combinations unbounded and ties the tier's meaning to the band value. Measured with
+   the shipped weights, all five Secondary signals saturated with no Primary present fused to
+   86.2 high before the gate.
 2. **Override floor.** For each Override signal present, `level = max(level, rule_severity)`
    and `Override` is set to the rule ID. Overrides are **never** combined; they set a
    minimum.
@@ -536,6 +544,8 @@ func (s *Scorer) Evaluate(tv fingerprint.TreeVector, b *calibrate.Baseline) Verd
   deviation-based signals.
 - `Signals` is never empty for `Level >= LevelMedium`. A medium-or-higher alert without
   stated evidence is a bug, not a detection.
+- `Level >= LevelMedium` implies at least one Primary signal contributed, or an Override set
+  the floor. Secondary signals never carry a verdict on their own, in any combination.
 
 ---
 

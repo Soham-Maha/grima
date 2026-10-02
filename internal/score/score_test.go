@@ -365,8 +365,15 @@ func TestNGramRenameChainReachesTheVerdict(t *testing.T) {
 	if !strings.Contains(sg.Detail, "4-grams") {
 		t.Fatalf("detail %q does not report the configured n-gram length", sg.Detail)
 	}
-	if encrypting.Score <= 0 {
-		t.Fatalf("score = %.1f, want above zero from the n-gram signal alone", encrypting.Score)
+	// Item 4.9 changed this signal's class contract. `ngram_rename_chain` is
+	// Secondary, so it is reported and carries its value — but it may not carry a
+	// verdict without a Primary companion (the fusion rule in Evaluate). The
+	// previous assertion here asked for a non-zero score "from the n-gram signal
+	// alone", which is exactly the solo-alertability the decision removes;
+	// TestSecondaryCorroboratesOnceAPrimaryIsPresent covers the other direction.
+	if encrypting.Score != 0 || encrypting.Level != LevelInfo {
+		t.Fatalf("a lone Secondary signal reached %s (%.1f), want info (0); it must not carry a verdict alone",
+			encrypting.Level, encrypting.Score)
 	}
 
 	benign := scorer.Evaluate(Inputs{Tree: drive("bulk-rewriter", false)})

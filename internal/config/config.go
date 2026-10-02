@@ -184,14 +184,20 @@ var DefaultSignalWeights = []Weight{
 	{Name: "rename_burst", Weight: 0.8},
 	{Name: "ngram_rename_chain", Weight: 0.2},
 	{Name: "unknown_extension_activity", Weight: 1.0},
-	// Secondary signals corroborate; none may carry a verdict alone. A signal is
-	// solo-alertable iff weight >= the medium band (45), so these sit at 0.4
-	// rather than 0.5. At 0.5 each scored exactly 50 and paged an operator with
-	// no second opinion — measured on a benign atomic-save workload, which
-	// alerted at medium on delete_rate alone.
+	// Secondary signals corroborate; none may carry a verdict alone. That is
+	// enforced structurally in score's fusion — a Secondary contributes only
+	// while a Primary signal is present (Sprint 4, item 4.9) — so these weights
+	// are corroboration strength rather than the guard, and the guard no longer
+	// depends on where the medium band sits. They sit at 0.4 because at 0.5 each
+	// solo-scored exactly 50 against a 45 band: measured on a benign atomic-save
+	// workload, which alerted at medium on delete_rate alone. Do not read 0.4 as
+	// a safety margin — the fusion rule is what makes the tier safe.
 	{Name: "delete_rate", Weight: 0.4},
 	{Name: "dir_fanout", Weight: 0.4},
 	{Name: "cum_bytes_rewritten", Weight: 0.4},
+	// static_reputation is a Secondary (design.md §5) that the scorer does not
+	// emit yet; Phase 7. Its weight is deliberately not bounded by the medium
+	// band because it cannot carry a verdict without a Primary either way.
 	{Name: "static_reputation", Weight: 0.6},
 	{Name: "bus_drops", Weight: 0.2},
 }

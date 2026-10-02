@@ -137,9 +137,34 @@ func (s *Scorer) Evaluate(in Inputs) Verdict {
 	// three weaker ones scored 56.4, so more evidence of the same attack read as
 	// less severe. Noisy-OR is monotonic — a signal can only add — which is the
 	// property a risk score has to have.
+	//
+	// Corroboration is structural, not arithmetic (Sprint 4, item 4.9). A
+	// Secondary signal may not carry a verdict; its weight applies only while at
+	// least one Primary signal is present. The arithmetic alternative — keep
+	// every Secondary weight below the medium band — bounds each signal but not
+	// a combination of them, and it is a property of the (weight, band) pair
+	// rather than of the tier: with the shipped weights, delete_rate +
+	// dir_fanout + cum_bytes_rewritten + ngram_rename_chain + bus_drops, all
+	// saturated and nothing else present, fuses to 86.2 high. static_reputation,
+	// a Secondary in design.md §5, is configured at 0.6 — 60.0 medium — for the
+	// day Phase 7 emits it. Gating on a Primary makes both impossible at any
+	// band value, so the tier's meaning no longer depends on where the band is
+	// set.
+	hasPrimary := false
+	for _, sg := range signals {
+		if sg.Class == ClassPrimary {
+			hasPrimary = true
+			break
+		}
+	}
+
 	combined := 1.0
 	for _, sg := range signals {
 		if sg.Class == ClassOverride {
+			continue
+		}
+		if sg.Class == ClassSecondary && !hasPrimary {
+			// Still reported below; it simply does not fuse on its own.
 			continue
 		}
 		w := s.cfg.WeightFor(sg.Name)
