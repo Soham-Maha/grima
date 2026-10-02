@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,7 +71,9 @@ type healthPayload struct {
 func parseHealth(t *testing.T, events *bus.Bus, sources []sensor.Source) healthPayload {
 	t.Helper()
 
-	snapshot := healthSnapshot(time.Now(), events, sources, fingerprint.NewEngine(config.Default()), nil)
+	// The liveness count is published by the engine loop, which these tests do
+	// not run; they exercise the health encoding, so it is zero here.
+	snapshot := healthSnapshot(time.Now(), events, sources, 0, nil)
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatalf("marshal health: %v", err)
@@ -284,8 +287,134 @@ func TestWriteStormSurfacesDropsInHealthAndVerdicts(t *testing.T) {
 		t.Fatalf("no verdict carried the drop count (%d dropped); verdicts: %v", dropped, hub.Latest())
 	}
 
-	health := healthSnapshot(time.Now(), events, nil, engine, nil)
+	health := healthSnapshot(time.Now(), events, nil, engine.Live(), nil)
 	if health.BusDropped != dropped {
 		t.Errorf("health bus_dropped = %d, want %d", health.BusDropped, dropped)
+	}
+}
+
+// newTestEngineLoop builds the real loop over a real bus and hub, ticking fast
+// enough to observe without a second of wall clock.
+func newTestEngineLoop(t *testing.T, cfg config.Config, events *bus.Bus, hub *web.Hub, live *atomic.Int64) engineLoop {
+	t.Helper()
+
+	return engineLoop{
+		scoreLoop: scoreLoop{
+			cfg:       cfg,
+			events:    events,
+			engine:    fingerprint.NewEngine(cfg),
+			scorer:    score.NewScorer(cfg),
+			overrides: newOverrideTracker(cfg.Window.DecayHalfLife.Std()),
+			responder: response.NewHandler(cfg, slog.New(slog.DiscardHandler)),
+			hub:       hub,
+			log:       slog.New(slog.DiscardHandler),
+		},
+		in:       events.Subscribe("fingerprint", cfg.Bus.Capacity/2),
+		live:     live,
+		interval: time.Millisecond,
+	}
+}
+
+// The engine is owned by one goroutine, and the scoring pass runs there too, so
+// an event written by the ingest path is read by the scorer without a lock.
+// Health is asked for the same state from another goroutine, and it must get a
+// published value rather than reaching into the engine: if it ever reads window
+// state directly again, this test fails under -race.
+func TestEngineLoopScoresWhileHealthIsReadConcurrently(t *testing.T) {
+	cfg := config.Default()
+	cfg.Scoring.AbsoluteWriteRate = 1
+
+	events := bus.New(cfg.Bus.Capacity, bus.DropOldest)
+	defer events.Close()
+
+	var live atomic.Int64
+	// health is exactly the callback the hub hands to the /healthz handler, so
+	// calling it from another goroutine is the read path an operator triggers.
+	health := func() web.Health {
+		return healthSnapshot(time.Now(), events, nil, int(live.Load()), nil)
+	}
+	hub := web.NewHub(health)
+	loop := newTestEngineLoop(t, cfg, events, hub, &live)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		loop.run(ctx)
+	}()
+
+	// A sensor's worth of events, published while the loop is draining them.
+	go func() {
+		for range 400 {
+			events.Publish(event.Event{
+				Kind: event.KindFileWrite, Path: "/data/secret.docx", Time: time.Now(),
+				PID: 4242, ProcName: "encryptor", Bytes: 4096,
+			})
+		}
+	}()
+
+	// An HTTP handler's worth of health reads, concurrent with the loop.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if health().LiveProcesses > 0 && len(hub.Latest()) > 0 {
+			return // the loop published both a liveness count and a verdict
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("loop published no verdict or liveness count: live=%d verdicts=%d",
+		health().LiveProcesses, len(hub.Latest()))
+}
+
+// A loop stops on cancellation and on a closed input channel, so shutting the
+// detector down cannot leave it ticking against a dead bus.
+func TestEngineLoopStopsOnCancelAndOnClosedInput(t *testing.T) {
+	cases := []struct {
+		name  string
+		stop  func(cancel context.CancelFunc, in chan event.Event)
+		check func(t *testing.T)
+	}{
+		{
+			name: "cancelled context",
+			stop: func(cancel context.CancelFunc, in chan event.Event) { cancel() },
+		},
+		{
+			name: "closed input channel",
+			stop: func(cancel context.CancelFunc, in chan event.Event) { close(in) },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			events := bus.New(cfg.Bus.Capacity, bus.DropOldest)
+			defer events.Close()
+
+			var live atomic.Int64
+			hub := web.NewHub(func() web.Health { return web.Health{} })
+			loop := newTestEngineLoop(t, cfg, events, hub, &live)
+
+			in := make(chan event.Event, 1)
+			loop.in = in
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				loop.run(ctx)
+			}()
+
+			tc.stop(cancel, in)
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("loop did not stop")
+			}
+		})
 	}
 }

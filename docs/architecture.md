@@ -488,8 +488,7 @@ sequenceDiagram
 | Each sensor | One goroutine per source, writing to the bus |
 | Bus | Fan-out goroutines, one per subscriber channel |
 | Rule layer | Single goroutine; rules are pure predicates over one event |
-| Fingerprint engine | Single goroutine owning all window state — **no locks on the hot path** |
-| Tree aggregator + scorer | Single goroutine, ticked at a fixed interval |
+| Fingerprint engine + scorer | **One** goroutine owning all window state: it consumes events and is ticked at a fixed interval — **no locks on the hot path** |
 | Web | One goroutine per SSE connection |
 | Baseline capture | Separate goroutine during warm-up only |
 
@@ -498,6 +497,15 @@ one goroutine, which removes lock contention from the hot path and makes the win
 contents trivially reproducible for tests. This is the same reasoning that makes a
 single-threaded deterministic scheduler attractive — it is cheaper than locking and it
 is testable.
+
+Scoring runs on that same goroutine, and that is not an implementation detail: the scoring
+pass *reads* window state, so running it anywhere else makes the engine multi-reader and
+reintroduces exactly the race the single-writer rule exists to remove. Reading it from a
+second goroutine is a `fatal error: concurrent map read and map write`, not a stale number.
+Consequently `/healthz` does not ask the engine for its process count; the owning goroutine
+publishes that count as it ticks, and health reads the published value. Any future reader of
+fingerprint state — a tree endpoint, an exporter, a debug dump — must go through the same
+publish-or-ask-the-loop route rather than taking a reference to the engine.
 
 ---
 

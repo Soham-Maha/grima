@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/bus"
@@ -89,11 +90,15 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 	overrides := newOverrideTracker(cfg.Window.DecayHalfLife.Std())
 
 	startedAt := time.Now()
+
+	// The engine is owned by the loop below, so anything outside it reads this
+	// published count rather than the engine itself. Staleness is bounded by the
+	// scoring interval.
+	var live atomic.Int64
 	hub := web.NewHub(func() web.Health {
-		return healthSnapshot(startedAt, events, sources, engine, baseline)
+		return healthSnapshot(startedAt, events, sources, int(live.Load()), baseline)
 	})
 
-	startFingerprintLoop(ctx, engine, events.Subscribe("fingerprint", cfg.Bus.Capacity/2))
 	startRuleLoop(ctx, ruleEngine, overrides, events.Subscribe("rules", cfg.Bus.Capacity))
 
 	if cfg.Web.Enabled {
@@ -108,17 +113,25 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 		}()
 	}
 
-	runScoreLoop(ctx, scoreLoop{
-		cfg:       cfg,
-		events:    events,
-		engine:    engine,
-		scorer:    scorer,
-		overrides: overrides,
-		responder: responder,
-		hub:       hub,
-		baseline:  baseline,
-		log:       log,
-	})
+	loop := engineLoop{
+		scoreLoop: scoreLoop{
+			cfg:       cfg,
+			events:    events,
+			engine:    engine,
+			scorer:    scorer,
+			overrides: overrides,
+			responder: responder,
+			hub:       hub,
+			baseline:  baseline,
+			log:       log,
+		},
+		in:   events.Subscribe("fingerprint", cfg.Bus.Capacity/2),
+		live: &live,
+	}
+	// Seed the published count on this goroutine: the loop has not started, so
+	// there is no writer to race with yet.
+	live.Store(int64(engine.Live()))
+	loop.run(ctx)
 
 	log.Info("grima stopped",
 		"published", events.Stats().Published,

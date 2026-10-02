@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/bus"
@@ -85,21 +86,49 @@ func (t *overrideTracker) For(pid int32) []score.Override {
 	return out
 }
 
-// startFingerprintLoop is the single writer for all fingerprint state.
-func startFingerprintLoop(ctx context.Context, engine *fingerprint.Engine, in <-chan event.Event) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
+// engineLoop owns the fingerprint engine. Every read and every write of window
+// state happens on the goroutine that runs it: events arrive on in and scoring
+// ticks arrive on the ticker, so the scoring pass reads state that the same
+// goroutine wrote. The single-writer invariant (docs/architecture.md §12) is a
+// property of this wiring, not a comment — the engine must never be handed to a
+// second goroutine, which is why its liveness count is published here rather
+// than read by the health handler directly.
+type engineLoop struct {
+	scoreLoop
+	in   <-chan event.Event
+	live *atomic.Int64
+
+	// interval is the scoring cadence. Zero means scoreInterval; tests set it
+	// lower so a loop does not have to run for a second to be observed.
+	interval time.Duration
+}
+
+func (l engineLoop) cadence() time.Duration {
+	if l.interval <= 0 {
+		return scoreInterval
+	}
+	return l.interval
+}
+
+// run blocks until ctx is cancelled or the event channel closes.
+func (l engineLoop) run(ctx context.Context) {
+	ticker := time.NewTicker(l.cadence())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-l.in:
+			if !ok {
 				return
-			case ev, ok := <-in:
-				if !ok {
-					return
-				}
-				engine.Apply(ev)
 			}
+			l.engine.Apply(ev)
+		case <-ticker.C:
+			l.live.Store(int64(l.engine.Live()))
+			l.evaluate()
 		}
-	}()
+	}
 }
 
 // startRuleLoop evaluates rules on raw events, so an override is recorded the
@@ -132,20 +161,6 @@ type scoreLoop struct {
 	hub       *web.Hub
 	baseline  *calibrate.Baseline
 	log       *slog.Logger
-}
-
-func runScoreLoop(ctx context.Context, loop scoreLoop) {
-	ticker := time.NewTicker(scoreInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			loop.evaluate()
-		}
-	}
 }
 
 func (l scoreLoop) evaluate() {
@@ -196,7 +211,7 @@ func worthReporting(v score.Verdict) bool {
 	return len(v.Signals) > 0 || v.Level >= score.LevelLow
 }
 
-func healthSnapshot(startedAt time.Time, events *bus.Bus, sources []sensor.Source, engine *fingerprint.Engine, baseline *calibrate.Baseline) web.Health {
+func healthSnapshot(startedAt time.Time, events *bus.Bus, sources []sensor.Source, live int, baseline *calibrate.Baseline) web.Health {
 	stats := events.Stats()
 
 	// Only sources that started are in this map, so a source that failed to
@@ -218,7 +233,7 @@ func healthSnapshot(startedAt time.Time, events *bus.Bus, sources []sensor.Sourc
 		CalibrationReady: baseline != nil && baseline.Ready(),
 		BusPublished:     stats.Published,
 		BusDropped:       stats.Dropped,
-		LiveProcesses:    engine.Live(),
+		LiveProcesses:    live,
 		Sensors:          sensors,
 		Uptime:           time.Since(startedAt).Seconds(),
 	}
