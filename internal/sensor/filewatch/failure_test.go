@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -115,16 +116,30 @@ func TestRefusedWatchIsCounted(t *testing.T) {
 	}
 }
 
-// Row 2's bounded-queue half: the add queue never drops silently. A full queue
-// is counted, because the directory it carried stays invisible until the next
-// rescan.
+// Row 2's bounded-queue half: the add queue never drops silently. A directory
+// discovered while the queue is full is a counted drop on the event-loop path,
+// because that goroutine must keep consuming events rather than block on a
+// registration. (The startup walk makes the opposite choice on purpose: it
+// registers inline instead, since a directory left unwatched at startup stays
+// blind until something rescans it.)
 func TestFullAddQueueIsCounted(t *testing.T) {
 	dir := t.TempDir()
 	s := testSource(t, dir)
 	s.addQueue = make(chan string, 1)
 
-	s.enqueueAdd(filepath.Join(dir, "a"))
-	s.enqueueAdd(filepath.Join(dir, "b"))
+	if !s.enqueueAdd(filepath.Join(dir, "a")) {
+		t.Fatal("the queue was empty and refused an entry")
+	}
+	if s.enqueueAdd(filepath.Join(dir, "b")) {
+		t.Fatal("a full queue accepted an entry")
+	}
+
+	created := filepath.Join(dir, "b")
+	if err := os.Mkdir(created, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	out := make(chan event.Event, 4)
+	s.handle(fsnotify.Event{Name: created, Op: fsnotify.Create}, out)
 
 	if n := s.Stats().Extra["add_dropped"]; n != 1 {
 		t.Fatalf("add_dropped = %d, want 1 for the directory the full queue dropped", n)

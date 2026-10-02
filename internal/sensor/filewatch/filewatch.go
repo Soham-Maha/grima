@@ -49,6 +49,9 @@ type Source struct {
 	// is waiting to be consumed.
 	addQueue   chan string
 	addDropped atomic.Uint64
+	// addPending counts directories queued for a watch that has not been
+	// registered yet, whether queued at startup or by a directory created later.
+	addPending atomic.Int64
 
 	events   atomic.Uint64
 	errors   atomic.Uint64
@@ -95,13 +98,24 @@ func (s *Source) Start(ctx context.Context, out chan<- event.Event) error {
 	go s.loop(ctx, out)
 	go s.addWorker(ctx)
 
-	watched := 0
+	// The initial walk is bounded. Registering every watch before returning
+	// means the walk advances only as fast as the event consumer drains — on a
+	// large tree under load that took seconds, and every other sensor and the
+	// score loop wait behind Start (sprints.md §25). Past the deadline the rest
+	// of the tree goes to the worker, which walks those subtrees itself.
+	deadline := time.Time{}
+	if d := s.cfg.FileWatch.StartupDeadline.Std(); d > 0 {
+		deadline = time.Now().Add(d)
+	}
+
+	watched, queued := 0, 0
 	for _, root := range s.cfg.General.MonitorPaths {
-		n, err := s.addTree(watcher, root)
+		n, q, err := s.addTreeUntil(watcher, root, deadline)
 		if err != nil {
 			s.log.Warn("partial watch", "path", root, "error", err)
 		}
 		watched += n
+		queued += q
 	}
 	if watched == 0 {
 		watcher.Close()
@@ -110,6 +124,11 @@ func (s *Source) Start(ctx context.Context, out chan<- event.Event) error {
 	}
 
 	s.log.Info("watching directories", "source", name, "count", watched)
+	if queued > 0 {
+		s.log.Warn("startup deadline reached; the rest of the tree is being watched in the background",
+			"source", name, "watched", watched, "queued", queued,
+			"deadline", s.cfg.FileWatch.StartupDeadline.Std().String())
+	}
 
 	return nil
 }
@@ -139,6 +158,7 @@ func (s *Source) Stats() sensor.Stats {
 			"rescans":             s.rescans.Load(),
 			"watch_failures":      s.watchFailures.Load(),
 			"add_dropped":         s.addDropped.Load(),
+			"add_pending":         uint64(max(0, s.addPending.Load())),
 			"attrib_causal_hits":  attribution.CausalHits,
 			"attrib_correlate":    attribution.CausalMisses,
 			"attrib_pending_drop": attribution.PendingDrops,
@@ -147,14 +167,18 @@ func (s *Source) Stats() sensor.Stats {
 	}
 }
 
-// enqueueAdd queues a directory for watching. A full queue is counted, never
-// silent: a directory whose watch is missed stays invisible until the next
-// rescan, and the count is what says so.
-func (s *Source) enqueueAdd(path string) {
+// enqueueAdd offers a directory to the watch queue, reporting whether it was
+// taken. The queue is bounded, so the caller decides what a full queue means:
+// the event loop counts the loss (it must not block), while the startup walk
+// registers the directory inline instead, because a directory that is never
+// watched is blind until something else rescans it.
+func (s *Source) enqueueAdd(path string) bool {
 	select {
 	case s.addQueue <- path:
+		s.addPending.Add(1)
+		return true
 	default:
-		s.addDropped.Add(1)
+		return false
 	}
 }
 
@@ -172,6 +196,7 @@ func (s *Source) addWorker(ctx context.Context) {
 			if _, err := s.addTree(s.watcher, path); err != nil {
 				s.log.Warn("partial watch", "path", path, "error", err)
 			}
+			s.addPending.Add(-1)
 		}
 	}
 }
@@ -226,7 +251,11 @@ func (s *Source) handle(fsEv fsnotify.Event, out chan<- event.Event) {
 	// behind, so adding inline would stall the sensor under load.
 	if fsEv.Op&fsnotify.Create != 0 {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			s.enqueueAdd(path)
+			// This goroutine must keep consuming events, so a full queue is a
+			// counted drop here rather than a blocking registration.
+			if !s.enqueueAdd(path) {
+				s.addDropped.Add(1)
+			}
 			return
 		}
 	}
@@ -319,6 +348,49 @@ func kindFor(op fsnotify.Op) (event.Kind, bool) {
 
 func isOverflow(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "overflow")
+}
+
+// addTreeUntil watches root and its subdirectories, stopping at the deadline:
+// the directory it stops on is queued for the background worker, which walks
+// that subtree itself. The first directory is always registered inline, so a
+// deadline that has already passed still leaves the sensor observing something
+// rather than returning the "nothing could be watched" error.
+func (s *Source) addTreeUntil(watcher *fsnotify.Watcher, root string, deadline time.Time) (added, queued int, firstErr error) {
+	expired := !deadline.IsZero() && time.Now().After(deadline)
+
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			s.watchFailures.Add(1)
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if added > 0 && expired {
+			// Past the deadline the subtree goes to the worker — unless the
+			// queue is full, in which case registering it here is slower but
+			// leaves it watched rather than blind.
+			if s.enqueueAdd(path) {
+				queued++
+				return filepath.SkipDir
+			}
+		}
+		if err := watcher.Add(path); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			s.watchFailures.Add(1)
+			return nil
+		}
+		added++
+		expired = !deadline.IsZero() && time.Now().After(deadline)
+		return nil
+	})
+
+	return added, queued, firstErr
 }
 
 // addTree watches root and every subdirectory under it, skipping subtrees it

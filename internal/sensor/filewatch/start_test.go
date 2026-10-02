@@ -3,11 +3,17 @@ package filewatch
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
+	"github.com/prateekpurohit13/grima/internal/attrib"
+	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/decoy"
 	"github.com/prateekpurohit13/grima/internal/event"
 )
 
@@ -116,4 +122,120 @@ func waitForEvent(t *testing.T, out chan event.Event, msg string) event.Event {
 		t.Fatal(msg)
 		return event.Event{}
 	}
+}
+
+// A deadline that has already passed must still leave the sensor observing
+// something: the root is registered inline whatever the clock says, and the rest
+// of the tree is queued rather than dropped. Deterministic — no reliance on how
+// fast this machine walks.
+func TestAddTreeUntilQueuesTheRestOnceTheDeadlineHasPassed(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, 5)
+
+	src := testSource(t, dir)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatalf("watcher: %v", err)
+	}
+	defer watcher.Close()
+	src.watcher = watcher
+	src.addQueue = make(chan string, addQueueDepth)
+
+	added, queued, err := src.addTreeUntil(watcher, dir, time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatalf("addTreeUntil: %v", err)
+	}
+	if added != 1 {
+		t.Errorf("added = %d, want the root registered inline", added)
+	}
+	// One queue entry per top-level subtree: the worker walks each subtree it is
+	// handed, so queueing the subtree root is what covers everything under it.
+	if queued != 5 {
+		t.Errorf("queued = %d, want one entry per subtree past the deadline", queued)
+	}
+	if len(src.addQueue) != 5 {
+		t.Fatalf("queue holds %d entries, want 5", len(src.addQueue))
+	}
+	if pending := src.addPending.Load(); pending != 5 {
+		t.Errorf("addPending = %d, want 5 while the queued directories are unregistered", pending)
+	}
+}
+
+// A startup deadline short enough to bite must not stop the sensor from starting
+// or from covering the whole tree: Start returns early, the remainder is counted
+// as pending, and every directory ends up watched.
+func TestStartWithADeadlineCoversTheRestInTheBackground(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, 600)
+
+	cfg := sensorConfig(dir)
+	cfg.FileWatch.StartupDeadline = config.Duration(time.Nanosecond)
+	src := New(cfg, attrib.New(time.Second), decoy.NewRegistry(), slog.New(slog.DiscardHandler))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan event.Event, 4096)
+	if err := src.Start(ctx, out); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer src.Close()
+
+	if pending := src.addPending.Load(); pending <= 0 {
+		t.Fatalf("addPending = %d immediately after Start, want the rest of the tree queued", pending)
+	}
+
+	// The worker must drain it and leave the tree fully covered.
+	deadline := time.Now().Add(60 * time.Second)
+	for src.addPending.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pending := src.addPending.Load(); pending != 0 {
+		t.Fatalf("addPending = %d after waiting, want the queued directories registered", pending)
+	}
+
+	// A directory the deadline skipped is only watched if the worker registered
+	// it: an event from inside one proves the coverage completed.
+	deep := filepath.Join(dir, "pkg-599", "lib")
+	written := filepath.Join(deep, "late.js")
+	writeTestFile(t, written, []byte("module.exports = 3\n"))
+	for _, ev := range drain(out) {
+		if ev.Path == written {
+			return
+		}
+	}
+	waitForEvent(t, out, "no event for a directory the startup deadline skipped")
+}
+
+// Zero means unbounded: the old behaviour, where Start registers the whole tree
+// before returning and nothing is left pending.
+func TestStartWithoutADeadlineRegistersEverythingInline(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, 40)
+
+	cfg := sensorConfig(dir)
+	cfg.FileWatch.StartupDeadline = 0
+	src := New(cfg, attrib.New(time.Second), decoy.NewRegistry(), slog.New(slog.DiscardHandler))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan event.Event, 4096)
+	if err := src.Start(ctx, out); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer src.Close()
+
+	if pending := src.addPending.Load(); pending != 0 {
+		t.Fatalf("addPending = %d with no deadline, want everything registered inline", pending)
+	}
+
+	written := filepath.Join(dir, "pkg-039", "lib", "inline.js")
+	writeTestFile(t, written, []byte("module.exports = 4\n"))
+	for _, ev := range drain(out) {
+		if ev.Path == written {
+			return
+		}
+	}
+	waitForEvent(t, out, "no event from a directory the inline walk registered")
 }

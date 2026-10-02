@@ -32,6 +32,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 23. [Sprint 2 Close-Out: An Amended Criterion, Four Harness Defects, One Deadlock](#23-sprint-2-close-out-an-amended-criterion-four-harness-defects-one-deadlock)
 24. [The Cerberus Split: What Is Asserted, and What Is Only Measured](#24-the-cerberus-split-what-is-asserted-and-what-is-only-measured)
 25. [Startup Has No Bound Under Load — Proposed Design Change](#25-startup-has-no-bound-under-load--proposed-design-change)
+26. [Corroboration Is Structural, Not Arithmetic](#26-corroboration-is-structural-not-arithmetic)
 
 ---
 
@@ -1841,4 +1842,73 @@ stops; `design.md` §3.1 and §13 updated in the same change.
 
 **Cost.** Around half a day, most of it the "returns early and the tree still completes" test.
 
-**Status.** Open — recorded in `plan.md` §11 as a decision, and queued as Sprint 4 item 4.14.
+**Status.** Adopted as item 4.14. `filewatch.startup_deadline` defaults to 10 s; the walk
+past the deadline is queued to the worker and counted as `add_pending`, the root is always
+registered inline so a deadline that has already passed still leaves the sensor observing
+something, and a full queue falls back to registering inline rather than leaving a directory
+blind. Verified: the 403-directory tree registers inline in 92 ms with `add_pending` 0, a
+600-directory tree with a nanosecond deadline returns immediately with the rest pending and
+ends fully covered, and `Start` with no deadline behaves exactly as before.
+
+---
+
+## 26. Corroboration Is Structural, Not Arithmetic
+
+Sprint 4 items 4.9 and 4.10 exist because Sprint 2 measured two arithmetic problems in the
+weight table (§18). Both are now closed by measurement, and the fix for the first is not the
+one the item proposed.
+
+### The problem the weight table could not solve
+
+§18 measured a Secondary signal paging an operator on its own, and the shipped response was to
+put every Secondary at 0.4 — below the medium band, so no single one can reach it. That bounds
+each signal and says nothing about a **combination**, which is the shape the arithmetic invites:
+
+| Evidence, no Primary present | Score | Level |
+|---|---|---|
+| `delete_rate` + `dir_fanout` + `cum_bytes_rewritten` + `ngram_rename_chain` + `bus_drops`, all saturated | **86.2** | high |
+| `static_reputation` alone at its configured 0.6 | **60.0** | medium |
+
+The first is reachable today: five Secondary observations of the same attack, none of which may
+alert, fusing to a high alert. The second is a trap waiting for Phase 7 to emit
+`static_reputation` — a Secondary by design (`design.md` §5), configured above the band. Neither
+is a tuning error; both are what a per-signal bound leaves open.
+
+### The decision
+
+**A Secondary signal corroborates; it does not carry a verdict.** Secondaries fuse only while at
+least one Primary is present. They are still reported in `Verdict.Signals` — the operator sees
+all the evidence — they simply cannot decide on their own, in any combination.
+
+The alternative the item suggested — keep lowering weights — was rejected because it ties the
+tier's *meaning* to the band value: a Secondary is a statement about evidence strength, and
+"weight < 45" is a statement about arithmetic. Gating on a Primary makes the two impossible at
+any band, and it gives `design.md` a checkable invariant: **`Level >= Medium` implies a Primary
+contributed, or an Override set the floor.**
+
+### 4.10: the first-seen-extension alert is kept, and priced
+
+The other half of §18 is that 30 files of a never-seen extension reach the medium band and
+accumulate without a burst. The decision is to **accept it and state the cost**: 23 novel writes
+cross the 45 band, 30 files score 60.0.
+
+A minimum-novelty floor was measured and rejected, and the reason is the sharper finding: the
+signal that carries a first-seen extension — `unknown_extension_activity` — is also what carries
+the **quiet drip** that item 2.2 rests on. Any floor low enough to be safe is high enough to
+silence a 24-file drip; the floor that moves 30 novel files below the band moves the drip below
+it too. The false-positive class and the detection are the same signal at different rates, so
+the honest answer is the alert, with the trade recorded rather than hidden.
+
+### What it cost, and how it was checked
+
+`alertability_test.go` prices every signal in the table — saturated alone, through the real
+scorer — and asserts that no combination of Secondaries can carry a verdict. One existing
+assertion was re-pinned rather than kept: `TestNGramRenameChainReachesTheVerdict` asserted a
+non-zero score *from the n-gram signal alone*, which is exactly the solo alertability this
+change removes.
+
+A fusion change is cross-cutting, so the scenarios that rest on the old arithmetic were re-run
+on the shipped binary: smoke **100.0 critical**, `rates.sh quiet-drip` still crosses at **49.9
+medium** (the cumulative track is a Primary, so the gate does not touch it), `cerberus.sh split`
+**95.2 critical**. The benign corpus was re-measured after the change as well: all six workloads
+silent, npm peaking at 23.4 low.

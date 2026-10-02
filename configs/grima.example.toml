@@ -28,6 +28,11 @@ entropy_sample_bytes = 4096
 # a storm that outran the buffer still reaches the fingerprint window.
 rescan_on_overflow = true
 sample_interval = "2s"
+# How long Start may spend registering watches on the initial tree. The rest are
+# handed to the background worker and counted as add_pending in /healthz, so a
+# large tree under load cannot delay the other sensors or the score loop. "0s"
+# means unbounded.
+startup_deadline = "10s"
 
 [procwatch]
 # How often the process table is sampled. Lower means tighter attribution and

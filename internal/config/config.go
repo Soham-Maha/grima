@@ -46,6 +46,11 @@ type FileWatchConfig struct {
 	EntropySampleBytes int      `toml:"entropy_sample_bytes"`
 	RescanOnOverflow   bool     `toml:"rescan_on_overflow"`
 	SampleInterval     Duration `toml:"sample_interval"`
+	// StartupDeadline bounds how long Start spends registering watches on the
+	// initial tree. Directories not reached in time are handed to the background
+	// worker, so a large tree under load cannot delay the whole detector. Zero
+	// means unbounded: register everything before returning.
+	StartupDeadline Duration `toml:"startup_deadline"`
 }
 
 // ProcWatchConfig holds process sensor settings.
@@ -222,6 +227,7 @@ func Default() Config {
 			EntropySampleBytes: 4096,
 			RescanOnOverflow:   true,
 			SampleInterval:     Duration(2 * time.Second),
+			StartupDeadline:    Duration(10 * time.Second),
 		},
 		ProcWatch: ProcWatchConfig{
 			SampleInterval: Duration(500 * time.Millisecond),
@@ -312,6 +318,9 @@ func (c Config) Validate() error {
 	}
 	if c.FileWatch.EntropySampleBytes <= 0 {
 		return fmt.Errorf("filewatch.entropy_sample_bytes must be positive, got %d", c.FileWatch.EntropySampleBytes)
+	}
+	if c.FileWatch.StartupDeadline.Std() < 0 {
+		return fmt.Errorf("filewatch.startup_deadline must not be negative, got %s", c.FileWatch.StartupDeadline.Std())
 	}
 	if c.Window.NGramLength <= 0 {
 		return fmt.Errorf("window.ngram_length must be positive, got %d", c.Window.NGramLength)

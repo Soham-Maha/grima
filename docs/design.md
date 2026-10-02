@@ -150,7 +150,12 @@ type Source interface {
 ### Contract
 
 1. `Start` returns once the source is observing, not when it finishes. It must not block
-   for the lifetime of the process.
+   for the lifetime of the process. For a source that must enumerate something before it can
+   observe — FileWatch's directory tree — *observing* means at least one monitored root is
+   watched: the remainder may be registered after `Start` returns, bounded by
+   `filewatch.startup_deadline`, with the number still queued surfaced as `add_pending` in
+   `/healthz`. A directory whose watch has not landed yet is covered by the overflow rescan
+   until it does.
 2. The source writes to `out` until `ctx` is cancelled or `Close` is called.
 3. `Start` and `Close` are idempotent with respect to a second `Close` — closing twice
    must not panic.

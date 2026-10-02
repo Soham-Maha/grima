@@ -506,7 +506,7 @@ is testable.
 | Failure | Consequence | Handling |
 |---|---|---|
 | Filesystem event overflow | Window under-counts | Re-scan the monitored tree, emit synthetic events, count the occurrence |
-| inotify watch exhaustion | Some directories unmonitored | Log, count, surface in dashboard health |
+| inotify watch exhaustion | Some directories unmonitored | Log, count, surface in dashboard health (`watch_failures`; `add_pending` while the startup walk is still catching up) |
 | Bus saturation | Events dropped | Explicit drop policy + drop counter as its own signal |
 | No baseline yet | Deviation signals unavailable | Uncalibrated mode: overrides, magic-byte checks, and an absolute write-rate fallback; stated in the UI |
 | Attribution ambiguous | Wrong PID on the alert | Events carry an attribution confidence. The shipped default (host mode) makes no per-process claim at all and files evidence against the host/tree fingerprint; `correlate` reports the top writer's share of recent bytes, and Windows auditing reports the OS-reported writer at 1.0 |
