@@ -139,7 +139,7 @@ window into the existing baseline rather than starting over:
 
 | Endpoint | What it gives you |
 |---|---|
-| `http://127.0.0.1:8787/` | Dashboard: per-process risk, expandable to the process-tree view with the members behind each aggregate |
+| `http://127.0.0.1:8787/` | Dashboard: a **risk timeline** (score over time, band lines at 20/45/70/88, points coloured by level), a **findings feed** (newest first, at or above the configured alert level, with the signal sentences), a **signal panel** (which evidence is doing the work), and the per-process tree view |
 | `/healthz` | The honest counters — `calibration_ready`, `bus_published`/`bus_dropped`, and per sensor `Events`, `Dropped`, `watch_failures`, `add_pending` |
 | `/api/verdicts` | The current verdicts as JSON, with the signals and values behind each one |
 | `/api/trees` | Verdicts grouped by tree root with their contributing processes |
