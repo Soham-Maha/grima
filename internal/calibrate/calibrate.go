@@ -71,6 +71,30 @@ func (b *Baseline) Ready() bool {
 	return total >= b.MinSamples
 }
 
+// Coverage reports how many samples each distribution in the baseline was
+// measured from.
+//
+// Ready is a single gate over the whole baseline; it does not say that every
+// deviation signal has something to compare against. A zero here means the
+// signal reading that distribution is omitted — unknown, not quiet — so an
+// operator reading "calibrated" can see which of them those are.
+func (b *Baseline) Coverage() map[string]int {
+	if b == nil {
+		return nil
+	}
+	entropy := 0
+	for _, d := range b.EntropyByExt {
+		entropy += d.N
+	}
+	return map[string]int{
+		"entropy":     entropy,
+		"write_rate":  b.WriteRate.N,
+		"rename_rate": b.RenameRate.N,
+		"delete_rate": b.DeleteRate.N,
+		"dir_fanout":  b.DirFanout.N,
+	}
+}
+
 // Sigma returns the standard deviation to use for an extension, applying the
 // configured floor so that a degenerate distribution never divides by zero.
 func (b *Baseline) Sigma(ext string) (Dist, bool) {

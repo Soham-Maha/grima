@@ -239,6 +239,16 @@ func healthSnapshot(startedAt time.Time, events *bus.Bus, sources []sensor.Sourc
 	}
 	if baseline != nil {
 		health.CalibrationAge = time.Since(baseline.CapturedAt).Seconds()
+
+		// Ready is one gate over the whole baseline, so it cannot say which
+		// signals actually have a distribution behind them. Publish the sample
+		// counts: a zero is an unavailable signal, not a quiet host.
+		if health.Extra == nil {
+			health.Extra = make(map[string]uint64, 5)
+		}
+		for name, n := range baseline.Coverage() {
+			health.Extra["baseline_samples_"+name] = uint64(n)
+		}
 	}
 	return health
 }

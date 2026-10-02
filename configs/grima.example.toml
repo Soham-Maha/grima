@@ -110,6 +110,19 @@ level_bands = { low = 20, medium = 45, high = 70, critical = 88 }
 # available, so this only affects uncalibrated mode.
 absolute_write_rate = 20
 
+# The smallest number of events in a window that counts as a burst when the
+# host's measured rate for that event kind is zero.
+#
+# A zero rate is a measurement, not a missing one: a warm-up on a quiet machine
+# records zero renames, and a burst signal compared against that zero would
+# either divide by zero or be switched off for the life of the deployment —
+# leaving the one signal that could see a rename storm permanently dead while
+# health still reported the baseline as ready. The floor keeps the signal live
+# without letting a single ordinary event saturate it: a host that never renames
+# stays silent through an editor's occasional atomic save, and still sees a mass
+# rename.
+zero_baseline_burst = 25
+
 # Fusion weights. These defaults are a starting point; Phase 6 replaces them
 # with values from a grid search over the scenario corpus.
 [[scoring.weights]]

@@ -31,24 +31,25 @@ func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
 	if windowSeconds <= 0 {
 		windowSeconds = 1
 	}
+	minBurst := s.cfg.Scoring.ZeroBaselineBurst
 
 	if calibrated {
 		if sg, ok := entropySignal(tv, b); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := writeBurstSignal(tv, b, windowSeconds, s.trustPerProcessBaseline()); ok {
+		if sg, ok := writeBurstSignal(tv, b, windowSeconds, s.trustPerProcessBaseline(), minBurst); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := renameBurstSignal(tv, b, windowSeconds); ok {
+		if sg, ok := renameBurstSignal(tv, b, windowSeconds, minBurst); ok {
 			out = append(out, sg)
 		}
 		if sg, ok := unknownExtensionSignal(tv, b); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := deleteRateSignal(tv, b, windowSeconds); ok {
+		if sg, ok := deleteRateSignal(tv, b, windowSeconds, minBurst); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := dirFanoutSignal(tv, b); ok {
+		if sg, ok := dirFanoutSignal(tv, b, minBurst); ok {
 			out = append(out, sg)
 		}
 	}
@@ -180,9 +181,9 @@ func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
 	}, true
 }
 
-func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64, trustPerProcess bool) (Signal, bool) {
+func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64, trustPerProcess bool, minBurst float64) (Signal, bool) {
 	rate := float64(tv.Writes) / windowSeconds
-	base, sigma, ok := rateBaseline(b, tv.ProcName, trustPerProcess)
+	base, sigma, ok := rateBaseline(b, tv.ProcName, trustPerProcess, windowSeconds, minBurst)
 	if !ok || base <= 0 {
 		return Signal{}, false
 	}
@@ -200,12 +201,12 @@ func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSe
 	}, true
 }
 
-func renameBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64) (Signal, bool) {
-	if b.RenameRate.Mean <= 0 {
+func renameBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.RenameRate, windowSeconds, minBurst)
+	if !ok {
 		return Signal{}, false
 	}
 	rate := float64(tv.Renames) / windowSeconds
-	base := b.RenameRate.Mean
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -260,12 +261,12 @@ func unknownExtensionSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (S
 	}, true
 }
 
-func deleteRateSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64) (Signal, bool) {
-	if b.DeleteRate.Mean <= 0 {
+func deleteRateSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.DeleteRate, windowSeconds, minBurst)
+	if !ok {
 		return Signal{}, false
 	}
 	rate := float64(tv.Deletes) / windowSeconds
-	base := b.DeleteRate.Mean
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -279,12 +280,16 @@ func deleteRateSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSe
 	}, true
 }
 
-func dirFanoutSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (Signal, bool) {
-	if b.DirFanout.Mean <= 0 {
+// dirFanoutSignal compares the tree's distinct directory count against the
+// host's pooled per-process distribution. The units are directories, not a rate,
+// so the zero-baseline floor is a directory count rather than a rate.
+func dirFanoutSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.DirFanout, 1, minBurst)
+	if !ok {
 		return Signal{}, false
 	}
 	dirs := tv.DirCount()
-	excess := float64(dirs) / b.DirFanout.Mean
+	excess := float64(dirs) / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
 		return Signal{}, false
@@ -293,7 +298,7 @@ func dirFanoutSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (Signal, 
 		Name:   "dir_fanout",
 		Class:  ClassSecondary,
 		Value:  value,
-		Detail: fmt.Sprintf("touched %d directories vs baseline %.1f", dirs, b.DirFanout.Mean),
+		Detail: fmt.Sprintf("touched %d directories vs baseline %.1f", dirs, base),
 	}, true
 }
 
@@ -337,6 +342,33 @@ func (s *Scorer) trustPerProcessBaseline() bool {
 	return s.cfg.Attribution.Mode == config.AttributionAudit
 }
 
+// deviationBase returns the denominator a deviation signal is measured against.
+//
+// The second result is false when the baseline holds no samples for this
+// quantity at all: that is unknown, and an unknown signal is omitted rather
+// than reported as zero.
+//
+// A measured rate of zero is not unknown. It says the host never performed the
+// action during warm-up, so there is no multiple to express tolerance in — and
+// disabling the signal, which is what comparing against zero used to do, left
+// the one signal that could see a burst on a quiet host permanently dead while
+// health still reported the baseline as ready. Flooring the denominator at the
+// smallest burst that counts as evidence keeps the ratio finite and the signal
+// available, without letting a single ordinary event saturate it: scale is the
+// window in seconds for a rate, or 1 for a count.
+func deviationBase(d calibrate.Dist, scale, minBurst float64) (float64, bool) {
+	if d.N <= 0 || scale <= 0 {
+		return 0, false
+	}
+	if d.Mean > 0 {
+		return d.Mean, true
+	}
+	if minBurst <= 0 {
+		return 0, false
+	}
+	return minBurst / scale, true
+}
+
 // rateBaseline returns the rate a write burst is measured against.
 //
 // A per-process baseline is only meaningful when the blamed process really is
@@ -346,16 +378,17 @@ func (s *Scorer) trustPerProcessBaseline() bool {
 // workload was blamed on firefox.exe, whose 1.67 writes/s baseline made the
 // burst look 5-10x over and produced a medium false positive, where the host
 // baseline of 130.3 writes/s would not have fired at all.
-func rateBaseline(b *calibrate.Baseline, procName string, trustPerProcess bool) (base, sigma float64, ok bool) {
+func rateBaseline(b *calibrate.Baseline, procName string, trustPerProcess bool, windowSeconds, minBurst float64) (base, sigma float64, ok bool) {
 	if trustPerProcess && procName != "" {
 		if v, found := b.WriteRateByProc[procName]; found && v > 0 {
 			return v, b.WriteRate.StdDev, true
 		}
 	}
-	if b.WriteRate.Mean > 0 {
-		return b.WriteRate.Mean, b.WriteRate.StdDev, true
+	base, ok = deviationBase(b.WriteRate, windowSeconds, minBurst)
+	if !ok {
+		return 0, 0, false
 	}
-	return 0, 0, false
+	return base, b.WriteRate.StdDev, true
 }
 
 func topUnknownExts(m map[string]int64, b *calibrate.Baseline, n int) string {

@@ -277,6 +277,23 @@ type Signal struct {
   processes that was dominated by process events (92.5/s measured), so a 65-file burst at
   2.2 writes/s could never reach its threshold and `write_burst` was unreachable on a real
   machine. A subset rate must never be compared against a superset baseline.
+- **A measured zero rate is not an absent one.** A warm-up on a quiet host records
+  `rename_rate = 0` and `delete_rate = 0`, which is a measurement: the host never performed
+  the action. Comparing a burst against that zero disables the signal — division by zero if
+  taken literally, and in the shipped code an early return — so the one signal that could
+  see a rename storm on a quiet host stayed dead for the life of the deployment while
+  `/healthz` reported `calibration_ready: true`. Measured consequence: **80 renames in one
+  second produced no verdict at all** on a host calibrated during a quiet window.
+  A zero-mean distribution is therefore floored at the smallest burst that counts as
+  evidence (`scoring.zero_baseline_burst`, default 25 events per window), which keeps the
+  ratio finite and the signal available while stopping one ordinary event from saturating
+  it: the same host stays silent through an editor's occasional atomic save and still sees
+  a mass rename.
+- **No samples is different from zero.** A distribution with `N == 0` was never measured,
+  so the signal reading it is omitted even when the activity is enormous. `Ready()` is a
+  single gate over the whole baseline and cannot express this; `Baseline.Coverage()` reports
+  the sample count behind each distribution, and `/healthz` publishes them as
+  `baseline_samples_*` so that "calibrated" is not read as "every signal is live".
 
 ### Why `unknown_extension_activity` rather than a rename signal
 
@@ -718,9 +735,15 @@ detector.
 | `history.dropped` | Verdicts overwritten because the ring is full | `/healthz`, dashboard |
 | `calibration.ready` | Whether deviation signals are active | dashboard banner |
 | `calibration.age` | Time since baseline capture | dashboard |
+| `baseline.samples.<dist>` | Samples behind each baseline distribution | `/healthz` |
 
 `/healthz` returns JSON. The dashboard shows a persistent banner while in uncalibrated
 mode, so an operator never mistakes "no alerts" for "calibrated and quiet."
+
+`calibration.ready` answers "is there a baseline?", not "is every signal live?". A baseline
+captured on a quiet host has no samples for some distributions, and the signals reading
+them are omitted — `baseline.samples.<dist>` is what distinguishes that from a quiet host.
+A zero there is an unavailable signal, not a silent one.
 
 ### The verdict history
 

@@ -130,7 +130,14 @@ type ScoringConfig struct {
 	// AbsoluteWriteRate is the writes-per-second threshold used when no host
 	// baseline exists. It is replaced by the calibrated write_burst signal as
 	// soon as a baseline is available.
-	AbsoluteWriteRate float64  `toml:"absolute_write_rate"`
+	AbsoluteWriteRate float64 `toml:"absolute_write_rate"`
+	// ZeroBaselineBurst is the smallest number of events in a window that
+	// counts as a burst when the host's measured rate for that event kind is
+	// zero. A zero rate is a measurement, not an absence of one: it says the
+	// host never did this during warm-up, so there is no multiple to express
+	// tolerance in. The floor keeps the deviation signal available instead of
+	// disabling it, while stopping one ordinary event from saturating it.
+	ZeroBaselineBurst float64  `toml:"zero_baseline_burst"`
 	Weights           []Weight `toml:"weights"`
 }
 
@@ -256,6 +263,7 @@ func Default() Config {
 		Scoring: ScoringConfig{
 			LevelBands:        Bands{Low: 20, Medium: 45, High: 70, Critical: 88},
 			AbsoluteWriteRate: 20,
+			ZeroBaselineBurst: 25,
 			Weights:           DefaultSignalWeights,
 		},
 		Rules: RulesConfig{
@@ -337,6 +345,9 @@ func (c Config) Validate() error {
 	}
 	if c.Scoring.AbsoluteWriteRate <= 0 {
 		return fmt.Errorf("scoring.absolute_write_rate must be positive, got %v", c.Scoring.AbsoluteWriteRate)
+	}
+	if c.Scoring.ZeroBaselineBurst <= 0 {
+		return fmt.Errorf("scoring.zero_baseline_burst must be positive, got %v", c.Scoring.ZeroBaselineBurst)
 	}
 	if err := c.validateAttribution(); err != nil {
 		return err

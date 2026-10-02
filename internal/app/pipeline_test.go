@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/bus"
+	"github.com/prateekpurohit13/grima/internal/calibrate"
 	"github.com/prateekpurohit13/grima/internal/config"
 	"github.com/prateekpurohit13/grima/internal/event"
 	"github.com/prateekpurohit13/grima/internal/fingerprint"
@@ -416,5 +417,35 @@ func TestEngineLoopStopsOnCancelAndOnClosedInput(t *testing.T) {
 				t.Fatal("loop did not stop")
 			}
 		})
+	}
+}
+
+// "Calibrated" is one gate over the whole baseline, so on its own it can read as
+// full coverage when a deviation signal has no distribution behind it. Health
+// publishes the sample count per distribution, and a zero there means the signal
+// is unavailable rather than that the host is quiet.
+func TestHealthPublishesBaselineSampleCounts(t *testing.T) {
+	baseline := &calibrate.Baseline{
+		CapturedAt:   time.Now(),
+		MinSamples:   1,
+		EntropyByExt: map[string]calibrate.Dist{".txt": {Mean: 5, StdDev: 1, N: 40}},
+		WriteRate:    calibrate.Dist{Mean: 3, StdDev: 1, N: 9},
+		RenameRate:   calibrate.Dist{Mean: 0, StdDev: 0, N: 7},
+	}
+
+	health := healthSnapshot(time.Now(), testBus(t), nil, 0, baseline)
+
+	if !health.CalibrationReady {
+		t.Fatal("baseline with enough entropy samples should be ready")
+	}
+	for name, want := range map[string]uint64{
+		"baseline_samples_entropy":     40,
+		"baseline_samples_write_rate":  9,
+		"baseline_samples_rename_rate": 7,
+		"baseline_samples_dir_fanout":  0,
+	} {
+		if got := health.Extra[name]; got != want {
+			t.Errorf("health %s = %d, want %d", name, got, want)
+		}
 	}
 }

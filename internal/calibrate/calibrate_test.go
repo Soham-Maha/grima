@@ -483,3 +483,41 @@ func TestRecalibrateWithoutABaselineCaptures(t *testing.T) {
 		t.Fatalf("Load = (%v, %v), want the saved baseline", stored, err)
 	}
 }
+
+// Ready is one gate over the whole baseline, so it cannot say which deviation
+// signals have a distribution behind them. Coverage reports the sample counts
+// that answer that question, and a zero must read as "unavailable", not "quiet".
+func TestCoverageReportsSamplesPerDistribution(t *testing.T) {
+	baseline := sampleBaseline()
+	baseline.RenameRate = Dist{Mean: 0, StdDev: 0, N: 7}
+	baseline.DeleteRate = Dist{Mean: 0, StdDev: 0, N: 7}
+	baseline.WriteRate = Dist{Mean: 3, StdDev: 1, N: 9}
+	// DirFanout is left at its zero value: nothing measured it.
+
+	cov := baseline.Coverage()
+
+	for name, want := range map[string]int{
+		"entropy":     50,
+		"write_rate":  9,
+		"rename_rate": 7,
+		"delete_rate": 7,
+		"dir_fanout":  0,
+	} {
+		if got := cov[name]; got != want {
+			t.Errorf("coverage[%s] = %d, want %d", name, got, want)
+		}
+	}
+
+	// A zero sample count is the signal saying it cannot be computed, so it must
+	// be present in the map rather than missing from it.
+	if _, ok := cov["dir_fanout"]; !ok {
+		t.Error("an unmeasured distribution is absent from coverage, not reported as zero")
+	}
+}
+
+func TestNilBaselineHasNoCoverage(t *testing.T) {
+	var baseline *Baseline
+	if cov := baseline.Coverage(); cov != nil {
+		t.Fatalf("nil baseline coverage = %v, want nil", cov)
+	}
+}
