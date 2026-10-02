@@ -35,6 +35,99 @@ type Health struct {
 	Extra            map[string]uint64       `json:"extra,omitempty"`
 }
 
+// treeDTO is one process tree as the dashboard renders it: the aggregate
+// verdict for its root plus the processes the aggregate was computed from.
+type treeDTO struct {
+	Root    int32       `json:"root"`
+	Name    string      `json:"proc_name"`
+	Level   string      `json:"level"`
+	Score   float64     `json:"score"`
+	Signals []signalDTO `json:"signals"`
+	Members []memberDTO `json:"members,omitempty"`
+}
+
+// memberDTO is one process contributing to a tree's aggregate. Own is true when
+// the process carries its own verdict; otherwise Level and Score are the tree's
+// aggregate, which is the risk assessment its activity feeds into.
+type memberDTO struct {
+	PID   int32   `json:"pid"`
+	Level string  `json:"level"`
+	Score float64 `json:"score"`
+	Own   bool    `json:"own"`
+}
+
+// signalDTO is one piece of evidence behind a tree's score.
+type signalDTO struct {
+	Name   string  `json:"name"`
+	Level  string  `json:"level"`
+	Value  float64 `json:"value"`
+	Detail string  `json:"detail"`
+}
+
+// buildTrees turns the per-root verdicts into the dashboard's tree view: one
+// entry per root, each carrying its contributing processes. A process that also
+// has its own verdict is folded into the tree that claims it as a member
+// instead of being reported twice.
+func buildTrees(verdicts []score.Verdict) []treeDTO {
+	byPID := make(map[int32]score.Verdict, len(verdicts))
+	for _, v := range verdicts {
+		byPID[v.PID] = v
+	}
+	claimed := make(map[int32]bool)
+	for _, v := range verdicts {
+		for _, pid := range v.PIDs {
+			if pid != v.PID {
+				if _, own := byPID[pid]; own {
+					claimed[pid] = true
+				}
+			}
+		}
+	}
+
+	out := make([]treeDTO, 0, len(verdicts))
+	for _, v := range verdicts {
+		if claimed[v.PID] {
+			continue
+		}
+		out = append(out, treeDTO{
+			Root:    v.PID,
+			Name:    v.ProcName,
+			Level:   v.Level.String(),
+			Score:   v.Score,
+			Signals: signalDTOs(v.Signals),
+			Members: memberDTOs(v, byPID),
+		})
+	}
+	return out
+}
+
+// memberDTOs lists a tree's contributors. The aggregator counts the root in
+// PIDs, so it is dropped here — it already has the tree's own row.
+func memberDTOs(v score.Verdict, byPID map[int32]score.Verdict) []memberDTO {
+	var members []memberDTO
+	seen := make(map[int32]bool, len(v.PIDs))
+	for _, pid := range v.PIDs {
+		if pid == v.PID || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		m := memberDTO{PID: pid, Level: v.Level.String(), Score: v.Score}
+		if own, ok := byPID[pid]; ok {
+			m.Level, m.Score, m.Own = own.Level.String(), own.Score, true
+		}
+		members = append(members, m)
+	}
+	return members
+}
+
+func signalDTOs(signals []score.Signal) []signalDTO {
+	out := make([]signalDTO, 0, len(signals))
+	for _, s := range signals {
+		out = append(out, signalDTO{Name: s.Name, Level: s.Level.String(), Value: s.Value, Detail: s.Detail})
+	}
+	return out
+}
+
 // Hub keeps the latest verdict per process and fans them out to live listeners.
 type Hub struct {
 	mu      sync.RWMutex
@@ -125,6 +218,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/", s.dashboard)
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/api/verdicts", s.verdicts)
+	mux.HandleFunc("/api/trees", s.trees)
 	mux.HandleFunc("/events", s.stream)
 
 	srv := &http.Server{
@@ -169,6 +263,21 @@ func (s *Server) verdicts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.hub.Latest())
 }
 
+func (s *Server) trees(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, buildTrees(s.hub.Latest()))
+}
+
+// treeFor renders one root's tree from the hub's current set, so a member that
+// also carries its own verdict resolves the same way the list endpoint does.
+func (s *Server) treeFor(root int32) (treeDTO, bool) {
+	for _, t := range buildTrees(s.hub.Latest()) {
+		if t.Root == root {
+			return t, true
+		}
+	}
+	return treeDTO{}, false
+}
+
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -188,7 +297,11 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case v := <-ch:
-			data, err := json.Marshal(v)
+			tree, ok := s.treeFor(v.PID)
+			if !ok {
+				continue
+			}
+			data, err := json.Marshal(tree)
 			if err != nil {
 				continue
 			}

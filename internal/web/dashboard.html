@@ -21,6 +21,12 @@
   .high { background: #4a2410; color: #ff9f6e; }
   .critical { background: #4d1a1a; color: #ff7b7b; }
   .sig { color: #9aa5b1; font-size: 12px; }
+  .count { color: #7b8794; font-size: 12px; margin-left: 6px; }
+  details { margin: 3px 0 7px; }
+  summary { color: #7b8794; font-size: 12px; cursor: pointer; }
+  table.members { margin-top: 4px; }
+  table.members th, table.members td { padding: 4px 10px; border-bottom: 1px solid #1d2026; }
+  .inherited { opacity: 0.65; }
   .empty { color: #7b8794; padding: 20px 0; }
   footer { margin-top: 24px; color: #7b8794; font-size: 12px; }
 </style>
@@ -49,27 +55,46 @@
 const rows = document.getElementById("rows");
 const banner = document.getElementById("banner");
 const footer = document.getElementById("footer");
-const seen = new Map();
+const trees = new Map();
 
-function levelClass(level) {
-  return ["info","low","medium","high","critical"][level] || "info";
+function memberRows(members) {
+  return members.map(m => {
+    const dim = m.own ? "" : " inherited";
+    const note = m.own ? "own verdict" : "contributes to the tree aggregate";
+    return `<tr>
+      <td${dim ? ` class="inherited"` : ""}>${m.pid}</td>
+      <td class="sig">&mdash;</td>
+      <td><span class="lvl ${m.level}${dim}">${m.level}</span></td>
+      <td${dim ? ` class="inherited"` : ""}>${m.score.toFixed(1)}</td>
+      <td class="sig">${note}</td>
+    </tr>`;
+  }).join("");
+}
+
+function treeRow(t) {
+  const evidence = (t.signals || [])
+    .map(s => `${s.name}: ${s.detail}`)
+    .join("<br>");
+  const members = t.members || [];
+  const count = members.length ? `<span class="count">${members.length + 1} procs</span>` : "";
+  const head = `<tr>
+      <td>${t.root}</td>
+      <td>${t.proc_name || "(unattributed)"}${count}</td>
+      <td><span class="lvl ${t.level}">${t.level}</span></td>
+      <td>${t.score.toFixed(1)}</td>
+      <td class="sig">${evidence || "&mdash;"}</td>
+    </tr>`;
+  if (members.length === 0) return head;  // a lone process renders exactly like a flat row
+  return head + `<tr><td colspan="5">
+      <details><summary>${members.length} contributing process${members.length === 1 ? "" : "es"}</summary>
+        <table class="members"><tbody>${memberRows(members)}</tbody></table>
+      </details></td></tr>`;
 }
 
 function render() {
-  const list = [...seen.values()].sort((a, b) => b.Score - a.Score);
+  const list = [...trees.values()].sort((a, b) => b.score - a.score);
   if (list.length === 0) return;
-  rows.innerHTML = list.map(v => {
-    const evidence = (v.Signals || [])
-      .map(s => `${s.Name}: ${s.Detail}`)
-      .join("<br>");
-    return `<tr>
-      <td>${v.PID}</td>
-      <td>${v.ProcName || "(unattributed)"}</td>
-      <td><span class="lvl ${levelClass(v.Level)}">${levelClass(v.Level)}</span></td>
-      <td>${v.Score.toFixed(1)}</td>
-      <td class="sig">${evidence || "&mdash;"}</td>
-    </tr>`;
-  }).join("");
+  rows.innerHTML = list.map(treeRow).join("");
 }
 
 async function refreshHealth() {
@@ -84,16 +109,18 @@ async function refreshHealth() {
   }
 }
 
-fetch("/api/verdicts").then(r => r.json()).then(list => {
-  (list || []).forEach(v => seen.set(v.PID, v));
+fetch("/api/trees").then(r => r.json()).then(list => {
+  (list || []).forEach(t => trees.set(t.root, t));
   render();
 });
 
 const events = new EventSource("/events");
 events.onmessage = e => {
-  const v = JSON.parse(e.data);
-  seen.set(v.PID, v);
-  render();
+  const t = JSON.parse(e.data);
+  if (t && t.root !== undefined) {
+    trees.set(t.root, t);
+    render();
+  }
 };
 
 refreshHealth();
