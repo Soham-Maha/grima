@@ -2,6 +2,7 @@ package fingerprint
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -235,9 +236,15 @@ func TestNGramReadsWriteToRenameChains(t *testing.T) {
 	if ng.Total != 17 {
 		t.Fatalf("k-grams = %d, want 17 from 20 events", ng.Total)
 	}
-	if ng.RenameChains != 17 || ng.ChainShare != 1 {
-		t.Fatalf("chains = %d of %d (share %.2f), want every k-gram to hold a write>rename chain",
-			ng.RenameChains, ng.Total, ng.ChainShare)
+	// Ten write>rename pairs among nineteen adjacent transitions: every file's
+	// write is followed by its rename, and each rename by the next write. The
+	// share is a density over transitions, so it is a little over a half — not
+	// one, which is what counting k-grams that merely contain a chain reported.
+	if ng.RenameChains != 10 || ng.Pairs != 19 {
+		t.Fatalf("chains = %d of %d adjacent transitions, want 10 of 19", ng.RenameChains, ng.Pairs)
+	}
+	if want := 10.0 / 19.0; math.Abs(ng.ChainShare-want) > 1e-9 {
+		t.Fatalf("chain share = %.4f, want %.4f", ng.ChainShare, want)
 	}
 	if ng.Count != 9 {
 		t.Fatalf("dominant k-gram count = %d, want 9", ng.Count)
@@ -347,13 +354,18 @@ func TestTreeNGramSpansChildren(t *testing.T) {
 		}
 	}
 
-	if child := e.Aggregate(31).NGram; child.RenameChains != child.Total {
-		t.Fatalf("child chains = %d of %d, want all", child.RenameChains, child.Total)
+	// Each child alternates write, rename: twenty chains among thirty-nine
+	// transitions. The tree reads one sequence over all members, so its chains
+	// are the sum rather than the average — a split workload cannot hide its
+	// shape by splitting it.
+	child := e.Aggregate(31).NGram
+	if child.RenameChains != 20 || child.Pairs != 39 {
+		t.Fatalf("child chains = %d of %d adjacent transitions, want 20 of 39", child.RenameChains, child.Pairs)
 	}
 	tree := e.Aggregate(30).NGram
-	if tree.RenameChains != tree.Total || tree.Total == 0 {
+	if tree.RenameChains != 40 || tree.Pairs != 80 {
 		t.Fatalf("tree chains = %d of %d, want the children's chains to survive aggregation",
-			tree.RenameChains, tree.Total)
+			tree.RenameChains, tree.Pairs)
 	}
 }
 
@@ -448,5 +460,84 @@ func TestRecreatedProcessStartsFromEmpty(t *testing.T) {
 	}
 	if tv.ProcName != "second" {
 		t.Fatalf("name = %q, want the new incarnation's name", tv.ProcName)
+	}
+}
+
+// One write followed by one rename is a single transition, not a pattern.
+// Counting k-grams that merely contain a chain made it saturate: at the default
+// k=32 one adjacency lies inside up to 31 overlapping k-grams, so an editor's
+// occasional atomic save read as a fully saturated encryption shape.
+func TestNGramOneChainIsNotAPattern(t *testing.T) {
+	cfg := config.Default() // k = 32
+	cfg.Window.DecayHalfLife = config.Duration(time.Hour)
+	e := NewEngine(cfg)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 13, ProcName: "editor", Time: now})
+	for i := range 38 {
+		e.Apply(write(13, fmt.Sprintf("/data/f%d.txt", i), 10, now))
+	}
+	e.Apply(rename(13, "/data/f37.txt", now)) // the one chain
+
+	ng := e.Aggregate(13).NGram
+	if ng.RenameChains != 1 {
+		t.Fatalf("chains = %d, want the single adjacency", ng.RenameChains)
+	}
+	if ng.Pairs != 38 {
+		t.Fatalf("pairs = %d, want 38 transitions from 39 events", ng.Pairs)
+	}
+	if ng.ChainShare > 0.05 {
+		t.Fatalf("chain share = %.3f from one adjacency of %d transitions", ng.ChainShare, ng.Pairs)
+	}
+}
+
+// A child that exits must leave its parent's child set. Leaving the dead PID
+// there made a reused PID a member of the old tree, so an unrelated process's
+// writes were charged to a parent that never spawned it.
+func TestReapUnlinksTheDeadProcessFromItsParent(t *testing.T) {
+	e := testEngine(t, time.Hour)
+	now := time.Now()
+
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 20, ProcName: "explorer", Time: now})
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 21, PPID: 20, ProcName: "worker", Time: now})
+	e.Apply(write(21, "/data/a.txt", 10, now))
+	e.Apply(event.Event{Kind: event.KindProcessExit, PID: 21, Time: now})
+
+	if kids := e.children[20]; len(kids) != 0 {
+		t.Fatalf("parent still claims %d children after the child exited: %v", len(kids), kids)
+	}
+	if tree := e.Aggregate(20); len(tree.PIDs) != 1 || tree.PIDs[0] != 20 {
+		t.Fatalf("parent tree = %v, want just the parent", tree.PIDs)
+	}
+
+	// The operating system hands the PID to an unrelated process.
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 21, PPID: 9999, ProcName: "stranger", Time: now})
+	e.Apply(write(21, "/data/stranger.txt", 10, now))
+
+	if tree := e.Aggregate(20); len(tree.PIDs) != 1 {
+		t.Fatalf("a reused PID was walked into the old tree: %v", tree.PIDs)
+	}
+	roots := e.Roots()
+	if len(roots) != 2 {
+		t.Fatalf("roots = %v, want the parent and the stranger scored separately", roots)
+	}
+}
+
+// The child index is the tree's index, so it has to shrink on exit. A
+// long-lived parent — explorer, a shell, a service manager — otherwise keeps one
+// entry per process it ever spawned.
+func TestReapKeepsTheChildIndexBounded(t *testing.T) {
+	e := testEngine(t, time.Hour)
+	now := time.Now()
+	e.Apply(event.Event{Kind: event.KindProcessStart, PID: 100, ProcName: "explorer", Time: now})
+
+	for cycle := range 200 {
+		for pid := int32(1000); pid < 1020; pid++ {
+			e.Apply(event.Event{Kind: event.KindProcessStart, PID: pid, PPID: 100, ProcName: "worker", Time: now})
+			e.Apply(event.Event{Kind: event.KindProcessExit, PID: pid, Time: now})
+		}
+		if kids := e.children[100]; len(kids) != 0 {
+			t.Fatalf("cycle %d: parent holds %d child entries, want none", cycle, len(kids))
+		}
 	}
 }

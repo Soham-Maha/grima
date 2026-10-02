@@ -267,6 +267,13 @@ type Signal struct {
   signal list rather than reported as `0`. Reporting `0` would misrepresent *unknown* as
   *benign*. Signals that read the window's own contents — `magic_mismatch`,
   `cum_bytes_rewritten`, `bus_drops`, `ngram_rename_chain` — are available either way.
+- **`bus_drops` reports the window, not the run.** The signal is fed the drops that
+  happened since the previous scoring tick, because that is the loss that made *this*
+  window under-count. A lifetime counter was fed instead, so a single overload episode
+  marked every verdict for the rest of the process's life: every root carried a permanent
+  ≤20% inflation, and since a verdict with any signal is published, the bounded history ring
+  filled with info-level noise and buried real findings. The lifetime total stays where it
+  belongs, in `/healthz` as `bus.dropped`.
 - `write_rate_absolute` exists precisely because omitting deviation signals leaves
   uncalibrated mode thin. It is a fixed bulk-modification threshold
   (`scoring.absolute_write_rate`, default 20/s) counting **writes and creates**, because bulk
@@ -376,8 +383,11 @@ func (e *Engine) Live() int
   race where a file is renamed before the sensor can read it.
 - `Aggregate(root)` sums the fingerprint of `root` and every descendant, and is what
   scoring consumes.
-- `Reap(pid)` releases state on `KindProcessExit`, re-parenting orphans to root rather
-  than dropping them from the tree.
+- `Reap(pid)` releases state on `KindProcessExit`, unlinks the process from its parent's
+  child set, and re-parents orphans to root rather than dropping them from the tree. The
+  unlink is what keeps the child index bounded by live processes: without it a long-lived
+  parent accumulates one entry per process it ever spawned, and a reused PID is walked into
+  a tree it was never part of.
 - Events with `PID == 0` are **not discarded**: they go into a host-level fingerprint
   (`HostName`, PID 0) so their file-derived evidence still reaches scoring. Detection must
   not depend on attribution succeeding — see `sprints.md` §13.
@@ -395,8 +405,9 @@ type NGram struct {
     Total        int     // k-grams observed in the window
     Sequence     string  // the most frequent k-gram, reduced to its cycle when it repeats
     Count        int     // occurrences of Sequence
-    RenameChains int     // k-grams containing a write followed by a rename
-    ChainShare   float64 // RenameChains / Total
+    Pairs        int     // adjacent event pairs in the window
+    RenameChains int     // adjacent pairs that are a write followed by a rename
+    ChainShare   float64 // RenameChains / Pairs
 }
 ```
 
@@ -409,6 +420,15 @@ type NGram struct {
 - `Total == 0` means the window held fewer than `k` events — no observation, which is not
   the same as "no chains". The scorer emits the signal only when `Total` and
   `RenameChains` both clear a floor.
+- **The share is a density over adjacent pairs, not over k-grams.** A k-gram spans k−1
+  pairs, so counting the k-grams that merely *contain* a chain made the share a step
+  function: at the default `k = 32` a single write→rename adjacency lies inside up to 31
+  overlapping k-grams, so one ordinary rename in a short window measured 0.875 and
+  saturated the signal. Measured before the fix: 38 writes and one rename reached value
+  `1.0`. Pairs are what the claim "a quarter of the window is chains" is about, and the
+  signal's normalization is anchored to the shape a real encryptor produces — `create,
+  write, rename, create`, one transition in four — saturating at that density and starting
+  at a tenth of it. `Total` and `Sequence` still come from k-grams; only the share changed.
 - The tree aggregate reads one sequence over the whole tree (each member's in-window
   samples in walk order), so a split workload's shape survives aggregation rather than
   being averaged across children.
@@ -563,9 +583,16 @@ func (s *Scorer) Evaluate(tv fingerprint.TreeVector, b *calibrate.Baseline) Verd
    leaves combinations unbounded and ties the tier's meaning to the band value. Measured with
    the shipped weights, all five Secondary signals saturated with no Primary present fused to
    86.2 high before the gate.
-2. **Override floor.** For each Override signal present, `level = max(level, rule_severity)`
-   and `Override` is set to the rule ID. Overrides are **never** combined; they set a
-   minimum.
+
+   The gate reads **contributed**, not *present*: a Primary whose weight is zero is not
+   evidence, so it does not open the gate. Otherwise an operator muting a noisy Primary by
+   removing its weight entry would silently restore the 86.2 verdict the gate exists to make
+   impossible — with the muted signal still listed in `Signals`, so the verdict would look
+   compliant while it was not.
+2. **Override floor.** For each Override signal present, `level = max(level, rule_severity)`.
+   Overrides are **never** combined; they set a minimum. `Override` names the highest-severity
+   rule among them, which is the rule that set the floor: rule hits arrive oldest-first, so
+   naming the first one reported a medium rule as the reason for a critical verdict.
 3. **Decay.** The decaying track's contribution is reduced by
    `exp(-Δt / decay_half_life)` when no further suspicious activity follows. The
    cumulative track is exempt.
@@ -770,6 +797,7 @@ detector.
 | `watch.failures` | inotify watch exhaustion / RDCW overflow | `/healthz` |
 | `history.size` / `history.depth` | Verdicts held on the timeline | `/healthz`, dashboard |
 | `history.dropped` | Verdicts overwritten because the ring is full | `/healthz`, dashboard |
+| `sse.dropped` | Verdicts a live listener did not keep up with | `/healthz` |
 | `calibration.ready` | Whether deviation signals are active | dashboard banner |
 | `calibration.age` | Time since baseline capture | dashboard |
 | `baseline.samples.<dist>` | Samples behind each baseline distribution | `/healthz` |
@@ -780,7 +808,19 @@ mode, so an operator never mistakes "no alerts" for "calibrated and quiet."
 `calibration.ready` answers "is there a baseline?", not "is every signal live?". A baseline
 captured on a quiet host has no samples for some distributions, and the signals reading
 them are omitted — `baseline.samples.<dist>` is what distinguishes that from a quiet host.
-A zero there is an unavailable signal, not a silent one.
+A zero there is an unavailable signal, not a silent one. `entropy_sigma_floor` and
+`min_samples` are the one exception to the file-wins rule: the stricter of the stored and
+the configured value applies, so tightening a knob takes effect on the next run rather than
+at the next `--calibrate`, and loosening it still requires a re-capture.
+
+### The latest-verdict view is current state
+
+`/api/verdicts` and `/api/trees` answer "what is happening now", so a verdict whose process
+has exited is dropped from them: a ghost at the top of the dashboard reads as present tense.
+The host pseudo-root is exempt — it is not a process that can exit, and in the shipped
+attribution mode most evidence is filed against it. What happened is the history ring's job,
+and it is unaffected. A live listener is a bounded queue like every other, so the verdicts a
+slow dashboard missed are counted in `sse.dropped` rather than lost silently.
 
 ### The verdict history
 

@@ -572,3 +572,52 @@ func TestMergePoolsTheCreateRate(t *testing.T) {
 		t.Fatalf("create rate mean = %v, want a pooled value between 4 and 8", got)
 	}
 }
+
+// A baseline file carries the settings it was captured with, so a tightened knob
+// used to validate and then do nothing until the next --calibrate. Tightening
+// takes effect on the next run; loosening still needs a re-capture, because that
+// is the direction that could silently weaken a running detector.
+func TestApplyConfigTightensButNeverLoosens(t *testing.T) {
+	baseline := sampleBaseline() // sigma floor 0.05, min samples 2
+	cfg := config.Default()
+	cfg.Calibration.EntropySigmaFloor = 0.5
+	cfg.Calibration.MinSamples = 100
+
+	tightened := ApplyConfig(baseline, cfg)
+	if len(tightened) != 2 {
+		t.Fatalf("tightened = %v, want both settings", tightened)
+	}
+	if baseline.SigmaFloor != 0.5 {
+		t.Errorf("sigma floor = %v, want the configured 0.5", baseline.SigmaFloor)
+	}
+	if baseline.MinSamples != 100 {
+		t.Errorf("min samples = %d, want the configured 100", baseline.MinSamples)
+	}
+	// The tightened threshold now applies: 50 entropy samples no longer clear it.
+	if baseline.Ready() {
+		t.Error("a baseline with 50 entropy samples is ready at a threshold of 100")
+	}
+}
+
+func TestApplyConfigLeavesALooserConfigurationAlone(t *testing.T) {
+	baseline := sampleBaseline()
+	baseline.SigmaFloor = 0.5
+	baseline.MinSamples = 100
+
+	cfg := config.Default() // 0.05 and 200... only the floor is looser here
+	cfg.Calibration.EntropySigmaFloor = 0.01
+	cfg.Calibration.MinSamples = 10
+
+	if tightened := ApplyConfig(baseline, cfg); len(tightened) != 0 {
+		t.Fatalf("tightened = %v, want nothing: the stored settings are already stricter", tightened)
+	}
+	if baseline.SigmaFloor != 0.5 {
+		t.Errorf("sigma floor = %v, want the stored 0.5", baseline.SigmaFloor)
+	}
+}
+
+func TestApplyConfigHandlesNoBaseline(t *testing.T) {
+	if tightened := ApplyConfig(nil, config.Default()); tightened != nil {
+		t.Fatalf("tightened = %v for a nil baseline", tightened)
+	}
+}

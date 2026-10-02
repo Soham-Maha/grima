@@ -20,6 +20,16 @@ const (
 	minRenameChains = 4
 )
 
+// The chain share saturates at the density a real encryptor produces. fsnotify
+// reports an encryptor's loop as create, write, rename, create — the rename's
+// destination arrives as its own create event — so one adjacent transition in
+// four is a write followed by a rename, and a tenth of that is ordinary file
+// management rather than a pattern.
+const (
+	chainShareFloor     = 0.1
+	chainShareSaturates = 1.0 / 3.0
+)
+
 // computeSignals derives every available signal. Signals whose baseline input is
 // missing are omitted rather than zeroed: zero means "benign", not "unknown".
 func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
@@ -175,9 +185,9 @@ func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
 	if ng.Total < minNGramWindows || ng.RenameChains < minRenameChains {
 		return Signal{}, false
 	}
-	// A quarter of the window being chains is ordinary file management; eight in
-	// ten saturates.
-	value := clamp01((ng.ChainShare - 0.25) / 0.55)
+	// A tenth of the transitions being chains is ordinary file management; the
+	// density a real encryptor cycle produces saturates.
+	value := clamp01((ng.ChainShare - chainShareFloor) / (chainShareSaturates - chainShareFloor))
 	if value <= 0 {
 		return Signal{}, false
 	}
@@ -185,8 +195,8 @@ func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
 		Name:  "ngram_rename_chain",
 		Class: ClassSecondary,
 		Value: value,
-		Detail: fmt.Sprintf("%d of %d %d-grams hold a write>rename chain; dominant %s x%d",
-			ng.RenameChains, ng.Total, ng.K, ng.Sequence, ng.Count),
+		Detail: fmt.Sprintf("%d of %d adjacent transitions are write>rename (%.0f%%); dominant %d-gram %s x%d",
+			ng.RenameChains, ng.Pairs, ng.ChainShare*100, ng.K, ng.Sequence, ng.Count),
 	}, true
 }
 
@@ -355,7 +365,9 @@ func bytesRewrittenSignal(tv fingerprint.TreeVector) (Signal, bool) {
 }
 
 // busDropSignal treats overload as evidence: a storm that saturates the bus also
-// means the window under-counted.
+// means the window under-counted. The count is the drops during this window, not
+// the run: a lifetime total would keep marking every verdict long after the
+// overload passed.
 func busDropSignal(dropped uint64) (Signal, bool) {
 	if dropped == 0 {
 		return Signal{}, false
@@ -364,7 +376,7 @@ func busDropSignal(dropped uint64) (Signal, bool) {
 		Name:   "bus_drops",
 		Class:  ClassSecondary,
 		Value:  clamp01(float64(dropped) / 1000),
-		Detail: fmt.Sprintf("%d events dropped by the bus (window under-counts)", dropped),
+		Detail: fmt.Sprintf("%d events dropped by the bus in this window (window under-counts)", dropped),
 	}, true
 }
 

@@ -161,13 +161,31 @@ type scoreLoop struct {
 	hub       *web.Hub
 	baseline  *calibrate.Baseline
 	log       *slog.Logger
+
+	// lastDropped is the bus drop counter as of the previous tick. The signal
+	// reports the drops that happened during the window being scored, not every
+	// drop the process has ever seen: with a lifetime counter, one overload
+	// episode marked every verdict for the rest of the run, and because a verdict
+	// with any signal is published, it also filled the history ring with
+	// info-level noise.
+	lastDropped uint64
 }
 
-func (l scoreLoop) evaluate() {
-	dropped := l.events.Stats().Dropped
+func (l *scoreLoop) evaluate() {
+	// The drop count is a delta over the window being scored, so an overload that
+	// has passed stops marking new verdicts.
+	total := l.events.Stats().Dropped
+	dropped := total - l.lastDropped
+	l.lastDropped = total
+
+	roots := l.engine.Roots()
+	// A verdict is the current assessment of a process, so one for a process that
+	// has exited is a ghost: it would sit at the top of the dashboard forever.
+	// The history ring keeps the incident.
+	defer l.hub.Retain(roots)
 
 	hostScored := false
-	for _, root := range l.engine.Roots() {
+	for _, root := range roots {
 		if root == 0 {
 			hostScored = true
 		}

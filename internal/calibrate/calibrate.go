@@ -103,6 +103,35 @@ func (b *Baseline) Coverage() map[string]int {
 	}
 }
 
+// ApplyConfig reconciles a loaded baseline with the running configuration and
+// returns the names of the settings it tightened.
+//
+// The file records the settings it was captured with, and Load prefers them —
+// which meant an operator could raise entropy_sigma_floor or min_samples, see
+// the configuration validate, and get no warning and no effect until the next
+// --calibrate. A knob that is validated and then ignored is worse than no knob.
+//
+// The stricter of the stored and the configured value wins, so tightening takes
+// effect immediately and loosening still requires a re-capture, which is the
+// direction that cannot silently weaken a running detector. The caller is told
+// what changed so it can say so.
+func ApplyConfig(b *Baseline, cfg config.Config) []string {
+	if b == nil {
+		return nil
+	}
+
+	var tightened []string
+	if cfg.Calibration.EntropySigmaFloor > b.SigmaFloor {
+		b.SigmaFloor = cfg.Calibration.EntropySigmaFloor
+		tightened = append(tightened, "entropy_sigma_floor")
+	}
+	if cfg.Calibration.MinSamples > b.MinSamples {
+		b.MinSamples = cfg.Calibration.MinSamples
+		tightened = append(tightened, "min_samples")
+	}
+	return tightened
+}
+
 // Sigma returns the standard deviation to use for an extension, applying the
 // configured floor so that a degenerate distribution never divides by zero.
 func (b *Baseline) Sigma(ext string) (Dist, bool) {

@@ -487,3 +487,67 @@ func TestRemoveDecoysUndoesAPreviousRun(t *testing.T) {
 		t.Fatalf("manifest survived removal: %v", err)
 	}
 }
+
+func anyVerdictHasSignal(verdicts []score.Verdict, name string) bool {
+	for _, v := range verdicts {
+		for _, sg := range v.Signals {
+			if sg.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// The drop signal describes the window being scored, not the run. A lifetime
+// counter kept marking every verdict long after the overload had passed — and
+// because a verdict carrying any signal is published, it also filled the bounded
+// history ring with info-level noise and buried real findings.
+func TestBusDropsSignalCoversOnlyTheWindowThatDropped(t *testing.T) {
+	cfg := config.Default()
+	cfg.Bus.Capacity = 8
+	cfg.Scoring.AbsoluteWriteRate = 1
+	log := slog.New(slog.DiscardHandler)
+
+	events := bus.New(cfg.Bus.Capacity, bus.DropOldest)
+	defer events.Close()
+
+	// Nothing consumes this bus, so it fills and the rest is dropped.
+	for range 500 {
+		events.Publish(event.Event{Kind: event.KindFileWrite, Path: "/data/a.txt", Time: time.Now()})
+	}
+	if events.Stats().Dropped == 0 {
+		t.Fatal("the storm dropped nothing; the test measured nothing")
+	}
+
+	engine := fingerprint.NewEngine(cfg)
+	for range 200 {
+		engine.Apply(event.Event{
+			Kind: event.KindFileWrite, Path: "/data/a.txt", Time: time.Now(),
+			PID: 4242, ProcName: "cryptor",
+		})
+	}
+
+	hub := web.NewHub(func() web.Health { return web.Health{} })
+	loop := &scoreLoop{
+		cfg:       cfg,
+		events:    events,
+		engine:    engine,
+		scorer:    score.NewScorer(cfg),
+		overrides: newOverrideTracker(cfg.Window.DecayHalfLife.Std()),
+		responder: response.NewHandler(cfg, log),
+		hub:       hub,
+		log:       log,
+	}
+
+	loop.evaluate()
+	if !anyVerdictHasSignal(hub.Latest(), "bus_drops") {
+		t.Fatalf("the window that dropped events carried no bus_drops: %v", hub.Latest())
+	}
+
+	// The next window drops nothing, so nothing should still be reporting drops.
+	loop.evaluate()
+	if anyVerdictHasSignal(hub.Latest(), "bus_drops") {
+		t.Fatalf("bus_drops survived into a window that dropped nothing: %v", hub.Latest())
+	}
+}

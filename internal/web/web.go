@@ -184,9 +184,13 @@ type Hub struct {
 	history []score.Verdict
 	histPos int
 	dropped uint64
-	subs    map[int]chan score.Verdict
-	nextSub int
-	health  func() Health
+	// subDropped counts verdicts a live listener did not keep up with. A listener
+	// is a bounded queue like every other in the system, so its losses are
+	// counted rather than silent.
+	subDropped uint64
+	subs       map[int]chan score.Verdict
+	nextSub    int
+	health     func() Health
 }
 
 // NewHub returns a hub that reports health through the given function.
@@ -222,6 +226,11 @@ func (h *Hub) Publish(v score.Verdict) {
 		select {
 		case ch <- v:
 		default:
+			// The listener is not keeping up. Counted, not silent: a dashboard
+			// that misses updates should be able to say so.
+			h.mu.Lock()
+			h.subDropped++
+			h.mu.Unlock()
 		}
 	}
 }
@@ -251,6 +260,38 @@ func (h *Hub) HistoryStats() (size int, dropped uint64, depth int) {
 	return len(h.history), h.dropped, historyDepth
 }
 
+// SubscriberDrops reports verdicts that live listeners did not keep up with.
+func (h *Hub) SubscriberDrops() uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.subDropped
+}
+
+// Retain drops the recorded verdicts whose root is no longer live.
+//
+// The latest-verdict view is a current assessment, so a verdict for a process
+// that has exited is a ghost: it stays at the top of the dashboard for as long
+// as the detector runs, and the operator reads it as present tense. The history
+// ring keeps the incident, which is where a past finding belongs.
+//
+// The host pseudo-root is always retained: it is not a process that can exit,
+// and in the shipped attribution mode it is where most evidence is filed.
+func (h *Hub) Retain(roots []int32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	live := make(map[int32]struct{}, len(roots)+1)
+	live[0] = struct{}{}
+	for _, root := range roots {
+		live[root] = struct{}{}
+	}
+	for pid := range h.latest {
+		if _, ok := live[pid]; !ok {
+			delete(h.latest, pid)
+		}
+	}
+}
+
 // Latest returns recorded verdicts, highest score first.
 func (h *Hub) Latest() []score.Verdict {
 	h.mu.RLock()
@@ -261,6 +302,22 @@ func (h *Hub) Latest() []score.Verdict {
 	h.mu.RUnlock()
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	return out
+}
+
+// LatestByPID returns the current verdicts keyed by root.
+//
+// Unlike Latest it does not rank them, so a caller resolving one process's
+// members does not re-sort every process on the host. That matters on the SSE
+// path, which does the lookup once per message per connected dashboard.
+func (h *Hub) LatestByPID() map[int32]score.Verdict {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	out := make(map[int32]score.Verdict, len(h.latest))
+	for pid, v := range h.latest {
+		out[pid] = v
+	}
 	return out
 }
 
@@ -356,6 +413,7 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	health.Extra["history_size"] = uint64(size)
 	health.Extra["history_dropped"] = dropped
 	health.Extra["history_depth"] = uint64(depth)
+	health.Extra["sse_dropped"] = s.hub.SubscriberDrops()
 	writeJSON(w, health)
 }
 
@@ -377,15 +435,18 @@ func (s *Server) trees(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, buildTrees(s.hub.Latest()))
 }
 
-// treeFor renders one root's tree from the hub's current set, so a member that
-// also carries its own verdict resolves the same way the list endpoint does.
-func (s *Server) treeFor(root int32) (treeDTO, bool) {
-	for _, t := range buildTrees(s.hub.Latest()) {
-		if t.Root == root {
-			return t, true
-		}
+// treeForVerdict renders one root's tree from the verdict being published, so a
+// member that also carries its own verdict resolves the same way the list
+// endpoint resolves it.
+func (s *Server) treeForVerdict(v score.Verdict) treeDTO {
+	return treeDTO{
+		Root:    v.PID,
+		Name:    v.ProcName,
+		Level:   v.Level.String(),
+		Score:   v.Score,
+		Signals: signalDTOs(v.Signals),
+		Members: memberDTOs(v, s.hub.LatestByPID()),
 	}
-	return treeDTO{}, false
 }
 
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
@@ -415,11 +476,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case v := <-ch:
-			tree, ok := s.treeFor(v.PID)
-			if !ok {
-				continue
-			}
-			data, err := json.Marshal(tree)
+			data, err := json.Marshal(s.treeForVerdict(v))
 			if err != nil {
 				continue
 			}

@@ -164,10 +164,24 @@ func (e *Engine) Aggregate(root int32) TreeVector {
 // Reap releases state for an exited process so memory tracks live processes
 // rather than every process ever seen.
 func (e *Engine) Reap(pid int32) {
-	if _, ok := e.procs[pid]; !ok {
+	p, ok := e.procs[pid]
+	if !ok {
 		return
 	}
 	delete(e.procs, pid)
+
+	// Unlink from the parent's child set. Leaving the dead PID there kept it a
+	// child of a live parent forever, which had two consequences: the set grew
+	// with every process ever spawned under a long-lived parent (the opposite of
+	// what this function promises), and a reused PID was walked into the old
+	// tree, so a stranger's writes landed in that parent's score and dashboard
+	// member list while the stranger was also scored as its own root.
+	if siblings, ok := e.children[p.ppid]; ok {
+		delete(siblings, pid)
+		if len(siblings) == 0 {
+			delete(e.children, p.ppid)
+		}
+	}
 
 	if kids, ok := e.children[pid]; ok {
 		for child := range kids {

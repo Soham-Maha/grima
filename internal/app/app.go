@@ -90,6 +90,12 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 	if err != nil {
 		log.Warn("baseline unreadable, running uncalibrated", "error", err)
 	}
+	// A baseline file carries the settings it was captured with, so a tightened
+	// knob would otherwise validate and then do nothing.
+	if tightened := calibrate.ApplyConfig(baseline, cfg); len(tightened) > 0 {
+		log.Warn("baseline was captured with looser settings; the configured values now apply",
+			"fields", tightened, "path", cfg.Calibration.BaselinePath)
+	}
 	if baseline == nil || !baseline.Ready() {
 		log.Warn("no usable baseline: deviation signals are inactive until one is captured",
 			"path", cfg.Calibration.BaselinePath)
