@@ -55,8 +55,8 @@ def collect(target: str, max_files: int) -> list[str]:
     return found
 
 
-def overwrite(path: str, partial_bytes: int, rng: random.Random) -> None:
-    """Overwrite a file with high-entropy bytes."""
+def overwrite(path: str, partial_bytes: int, rng: random.Random) -> int:
+    """Overwrite a file with high-entropy bytes, and report how many it wrote."""
     size = os.path.getsize(path)
     if partial_bytes and size > partial_bytes:
         payload = rng.randbytes(partial_bytes)  # intermittent: leave the rest in place
@@ -67,6 +67,7 @@ def overwrite(path: str, partial_bytes: int, rng: random.Random) -> None:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
+    return len(payload)
 
 
 def rename_to_suffix(path: str, suffix: str) -> str:
@@ -94,13 +95,23 @@ def main() -> int:
     delay = RATE_DELAYS[args.rate]
     print(f"{len(files)} files, rate={args.rate}, suffix={args.suffix or '(none)'}")
 
+    # One progress line per file, with a running byte count, so a harness can
+    # report time-to-detect in bytes encrypted rather than in seconds: the line
+    # that precedes the detector's alert is the amount of work done before it.
+    # Parsed by testdata/scenarios/ablate.py; harmless to everything else, which
+    # only reads the summary lines.
+    done_files = 0
+    done_bytes = 0
     for path in files:
         try:
-            overwrite(path, args.partial_bytes if args.rate == "intermittent" else 0, rng)
+            written = overwrite(path, args.partial_bytes if args.rate == "intermittent" else 0, rng)
             rename_to_suffix(path, args.suffix)
         except OSError as exc:
             print(f"skip {path}: {exc}", file=sys.stderr)
             continue
+        done_files += 1
+        done_bytes += written
+        print(f"progress files={done_files} bytes={done_bytes}", flush=True)
         if delay:
             time.sleep(delay)
 

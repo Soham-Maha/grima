@@ -394,18 +394,39 @@ Report as **false positives per 24h of benign activity**, not as a percentage.
 
 ## 13. Run the ablation
 
-This table is the paper's results section. Run each signal subset over the same corpus:
+This table is the paper's results section. Each subset restricts which signals may move the
+score — every weight outside the subset is zeroed, so the signal still appears in the verdict
+as evidence but cannot contribute to the decision — and the same corpus runs against the same
+detector for every subset.
 
 ```sh
-python3 testdata/scenarios/ablate.py \
-    --corpus testdata/corpus/ \
-    --subsets rules_only,entropy,entropy+rename,all_signals \
-    --out results/ablation.json
+python testdata/scenarios/ablate.py --rounds 3 --out results/ablation.json
 ```
 
-**Expected output columns:** subset, detection rate, false positives/24h, TTD in bytes
-(median and 95th percentile), per-family generalization (train on family A, test on
-family B).
+Subsets are cumulative, so each row is the *addition* of one group:
+
+| Subset | Signals that may move the score | Baseline |
+|---|---|---|
+| `rules_only` | none — overrides only | no |
+| `+entropy` | entropy deviation, magic-byte mismatch | no |
+| `+rename` | the above, plus rename burst, n-gram rename chain, first-seen extension | no |
+| `+calibration` | the above, plus write burst, delete rate, dir fan-out, cumulative bytes, absolute write rate | yes |
+| `all` | the shipped weight table | yes |
+
+The corpus defaults to the three encryptor rates (`burst`, `drip`, `intermittent`) and every
+`benign-*.sh` workload. A calibrated subset captures a baseline first, and for a benign
+workload the workload itself runs during that capture: a baseline that never saw the
+workload's extensions reports them as first-seen novelty in the measured pass, which is the
+harness defect that once made npm look like a false positive (§21).
+
+**Expected output columns:** subset, rounds, attack runs, detected, detection rate at the
+threshold where the benign corpus reaches a 1% false-positive rate, TTD in bytes (median and
+95th percentile), false positives per 24h. Every headline number is a range over rounds, not
+a single figure — one run of one scenario is not a measurement (§15, §24).
+
+Time-to-detect is read from the workload's own progress lines, so it only means anything
+where the attack outlives the detector's first evaluation tick; a burst that finishes inside
+that tick reports its whole corpus, which is a late detection rather than a missing number.
 
 An ablation row that does not move the numbers is a signal that is not earning its
 complexity. Say so in the paper rather than keeping it.
