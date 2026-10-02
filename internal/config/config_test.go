@@ -123,6 +123,54 @@ func TestValidateRejectsSuspendBelowCritical(t *testing.T) {
 	}
 }
 
+// Happy path: opting in with the required critical level is accepted, with or
+// without an alert cooldown.
+func TestValidateAcceptsSuspendAtCritical(t *testing.T) {
+	cfg := Default()
+	cfg.Response.EnableSuspend = true
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("enable_suspend with the default critical level: %v", err)
+	}
+	cfg.Response.AlertCooldown = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("alert_cooldown alongside suspend: %v", err)
+	}
+}
+
+// Throttling is off by default so nothing regresses to a quieter alert stream.
+func TestAlertCooldownDefaultsOff(t *testing.T) {
+	if got := Default().Response.AlertCooldown.Std(); got != 0 {
+		t.Fatalf("alert_cooldown = %s, want 0 (off)", got)
+	}
+}
+
+func TestLoadAlertCooldown(t *testing.T) {
+	path := writeConfig(t, `
+[response]
+alert_cooldown = "45s"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Response.AlertCooldown.Std(); got != 45*time.Second {
+		t.Fatalf("alert_cooldown = %s, want 45s", got)
+	}
+}
+
+// Sad path: a negative cooldown would re-arm every alert, which reads like
+// throttling is on while it does nothing.
+func TestValidateRejectsNegativeAlertCooldown(t *testing.T) {
+	cfg := Default()
+	cfg.Response.AlertCooldown = Duration(-time.Second)
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a negative alert_cooldown should be rejected")
+	}
+}
+
 func TestDurationUnmarshalRejectsGarbage(t *testing.T) {
 	var d Duration
 	if err := d.UnmarshalText([]byte("soon")); err == nil {

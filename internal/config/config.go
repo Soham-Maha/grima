@@ -144,6 +144,9 @@ type ResponseConfig struct {
 	EnableSuspend   bool   `toml:"enable_suspend"`
 	SuspendMinLevel string `toml:"suspend_min_level"`
 	AlertMinLevel   string `toml:"alert_min_level"`
+	// AlertCooldown holds repeat alerts for one process this long. Zero disables
+	// throttling, so every scoring tick over the alert band logs an alert.
+	AlertCooldown Duration `toml:"alert_cooldown"`
 }
 
 // WebConfig holds dashboard settings.
@@ -265,6 +268,7 @@ func Default() Config {
 			EnableSuspend:   false,
 			SuspendMinLevel: "critical",
 			AlertMinLevel:   "medium",
+			AlertCooldown:   0,
 		},
 		Web: WebConfig{
 			Enabled: true,
@@ -329,6 +333,9 @@ func (c Config) Validate() error {
 	}
 	if c.Response.EnableSuspend && c.Response.SuspendMinLevel != "critical" {
 		return fmt.Errorf("response.enable_suspend requires suspend_min_level = \"critical\", got %q", c.Response.SuspendMinLevel)
+	}
+	if c.Response.AlertCooldown.Std() < 0 {
+		return fmt.Errorf("response.alert_cooldown must not be negative, got %s", c.Response.AlertCooldown.Std())
 	}
 	for _, w := range c.Scoring.Weights {
 		if w.Weight < 0 {

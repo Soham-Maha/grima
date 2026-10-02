@@ -9,6 +9,8 @@ package response
 import (
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/prateekpurohit13/grima/internal/config"
 	"github.com/prateekpurohit13/grima/internal/score"
@@ -36,12 +38,27 @@ func (a Action) String() string {
 	return "action(?)"
 }
 
+// maxOpenIncidents bounds the throttle table. A process that alerts and then
+// disappears without a below-band verdict would otherwise leak an entry.
+const maxOpenIncidents = 4096
+
 // Handler applies response policy to verdicts.
 type Handler struct {
 	cfg        config.Config
 	alertMin   score.Level
 	suspendMin score.Level
 	log        *slog.Logger
+
+	// suspend is the platform primitive, held as a field so a test can exercise
+	// the failure path without a suspendable target.
+	suspend func(int32) error
+	// now is the clock, held as a field so a test can advance past a cooldown.
+	now func() time.Time
+
+	mu sync.Mutex
+	// alerts maps a verdict's tree root to the last alert it produced while its
+	// incident is open.
+	alerts map[int32]time.Time
 }
 
 // NewHandler builds a handler from configuration.
@@ -54,6 +71,9 @@ func NewHandler(cfg config.Config, log *slog.Logger) *Handler {
 		alertMin:   alertMin,
 		suspendMin: suspendMin,
 		log:        log,
+		suspend:    suspendProcess,
+		now:        time.Now,
+		alerts:     make(map[int32]time.Time),
 	}
 }
 
@@ -69,12 +89,21 @@ func (h *Handler) Decide(v score.Verdict) Action {
 }
 
 // Apply performs the action for a verdict.
+//
+// An alert throttles per incident: the incident is identified by the verdict's
+// tree root, so one persistent condition produces one alert rather than one per
+// scoring tick. A verdict below the alert band ends the incident, and the
+// cooldown expiring re-arms the next alert.
 func (h *Handler) Apply(v score.Verdict) error {
 	switch h.Decide(v) {
 	case Observe:
+		h.clearIncident(v.PID)
 		return nil
 
 	case Alert:
+		if !h.alertDue(v.PID) {
+			return nil
+		}
 		h.log.Warn("ransomware risk detected",
 			"pid", v.PID,
 			"process", v.ProcName,
@@ -86,7 +115,7 @@ func (h *Handler) Apply(v score.Verdict) error {
 		return nil
 
 	case Suspend:
-		if err := suspendProcess(v.PID); err != nil {
+		if err := h.suspend(v.PID); err != nil {
 			return fmt.Errorf("suspend pid %d: %w", v.PID, err)
 		}
 		h.log.Warn("process suspended",
@@ -99,6 +128,49 @@ func (h *Handler) Apply(v score.Verdict) error {
 		return nil
 	}
 	return nil
+}
+
+// alertDue reports whether an alert for a tree root is due, and records it when
+// it is. Without a cooldown every verdict alerts; otherwise the first alert
+// opens the incident and repeats are held until the cooldown elapses.
+func (h *Handler) alertDue(root int32) bool {
+	cooldown := h.cfg.Response.AlertCooldown.Std()
+	if cooldown <= 0 {
+		return true
+	}
+
+	now := h.now()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if last, open := h.alerts[root]; open && now.Sub(last) < cooldown {
+		h.log.Debug("alert suppressed by cooldown", "pid", root, "since", now.Sub(last).Round(time.Second))
+		return false
+	}
+	if len(h.alerts) >= maxOpenIncidents {
+		h.prune(now, cooldown)
+	}
+	h.alerts[root] = now
+	return true
+}
+
+// clearIncident ends the incident for a tree root, so its next alert is due
+// immediately instead of waiting out the cooldown.
+func (h *Handler) clearIncident(root int32) {
+	h.mu.Lock()
+	delete(h.alerts, root)
+	h.mu.Unlock()
+}
+
+// prune forgets incidents whose cooldown has elapsed. Forgetting one is
+// harmless: the next alert after a cooldown is emitted anyway.
+func (h *Handler) prune(now time.Time, cooldown time.Duration) {
+	for root, last := range h.alerts {
+		if now.Sub(last) >= cooldown {
+			delete(h.alerts, root)
+		}
+	}
 }
 
 func signalSummary(v score.Verdict) string {

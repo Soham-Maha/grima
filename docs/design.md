@@ -620,6 +620,16 @@ score is a denial-of-service primitive; a false positive against a database proc
 worse than a missed detection that alerts. `response.suspend_min_level` must be
 `Critical` and `response.enable_suspend` must be explicitly set.
 
+**Alerts throttle per incident.** The score loop emits a verdict on every tick, so a
+persistent condition would otherwise log an alert every second. An *incident* is
+identified by the verdict's tree root — the process, or the host when no process is
+claimed — and `response.alert_cooldown` holds further alerts for that root until it
+elapses. An incident ends when a verdict below `alert_min_level` reaches the responder
+(its next rise then alerts immediately), or, if the root stops carrying evidence
+entirely, when the cooldown elapses. A zero cooldown disables throttling and is the
+default, so alert emission is unchanged unless opted into. Throttling gates only the
+alert log; the verdict stream and the dashboard are unaffected.
+
 ---
 
 ## 11. Configuration Reference
@@ -668,6 +678,7 @@ weight = 1.0
 enable_suspend    = false
 suspend_min_level = "critical"
 alert_min_level   = "medium"
+alert_cooldown    = "0s"               # 0 disables per-incident alert throttling
 
 [web]
 enabled = true

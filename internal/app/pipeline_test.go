@@ -1,10 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,7 +15,10 @@ import (
 	"github.com/prateekpurohit13/grima/internal/event"
 	"github.com/prateekpurohit13/grima/internal/fingerprint"
 	"github.com/prateekpurohit13/grima/internal/platform"
+	"github.com/prateekpurohit13/grima/internal/response"
+	"github.com/prateekpurohit13/grima/internal/score"
 	"github.com/prateekpurohit13/grima/internal/sensor"
+	"github.com/prateekpurohit13/grima/internal/web"
 )
 
 // countingSource is a sensor that exposes health counters.
@@ -173,5 +178,50 @@ func TestAllSensorsFailingIsAnError(t *testing.T) {
 
 	if _, err := startSensors(ctx, config.Default(), host, testBus(t), slog.New(slog.DiscardHandler)); err == nil {
 		t.Fatal("startSensors succeeded with no usable sensor")
+	}
+}
+
+// The score loop publishes on every tick, so the response handler is what
+// collapses a persistent condition into one alert per incident when the
+// cooldown is configured. This drives the real app-to-response call path.
+func TestPublishThrottlesAlertsPerIncident(t *testing.T) {
+	cases := []struct {
+		name     string
+		cooldown time.Duration
+		want     int
+	}{
+		{"cooldown off alerts every tick", 0, 5},
+		{"cooldown on alerts once", 30 * time.Second, 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Response.AlertCooldown = config.Duration(tc.cooldown)
+
+			var buf bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&buf, nil))
+			hub := web.NewHub(func() web.Health { return web.Health{} })
+			loop := scoreLoop{
+				responder: response.NewHandler(cfg, log),
+				hub:       hub,
+				log:       log,
+			}
+
+			v := score.Verdict{
+				PID:      4242,
+				ProcName: "encryptor",
+				Score:    95,
+				Level:    score.LevelCritical,
+				Signals:  []score.Signal{{Name: "R-DECOY-TOUCH", Class: score.ClassOverride, Level: score.LevelCritical}},
+			}
+			for range 5 {
+				loop.publish(v)
+			}
+
+			if got := strings.Count(buf.String(), "ransomware risk detected"); got != tc.want {
+				t.Fatalf("alerts = %d, want %d\n%s", got, tc.want, buf.String())
+			}
+		})
 	}
 }
