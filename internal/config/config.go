@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -362,7 +363,14 @@ func (c Config) Validate() error {
 	}
 	for _, p := range c.General.MonitorPaths {
 		if !filepath.IsAbs(p) {
-			return fmt.Errorf("general.monitor_paths entry %q must be an absolute path", p)
+			// The shipped example uses POSIX paths, and on Windows those are not
+			// absolute — `/home` resolves against the current drive. Say what the
+			// platform wants rather than leaving the operator to work it out.
+			hint := `e.g. "/home/you" or "/srv/data"`
+			if runtime.GOOS == "windows" {
+				hint = `on Windows that means a drive letter, e.g. "C:/Users/you/Documents"`
+			}
+			return fmt.Errorf("general.monitor_paths entry %q must be an absolute path (%s)", p, hint)
 		}
 	}
 	return nil

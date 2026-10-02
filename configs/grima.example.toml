@@ -8,8 +8,14 @@
 # startup instead of silently disabling a setting.
 
 [general]
-# Directories to watch. Must be absolute paths. Anything outside this list is
-# invisible to the detector.
+# Directories to watch. Must be absolute paths, and the form depends on the host:
+#
+#   Windows   monitor_paths = ["C:/Users/you/Documents"]
+#   Linux     monitor_paths = ["/home/you", "/srv/data"]
+#
+# `/home` is not an absolute path on Windows — it resolves against the current
+# drive — so the POSIX form below is rejected there with a message saying so.
+# Anything outside this list is invisible to the detector.
 monitor_paths = ["/home", "/srv"]
 log_level = "info"
 

@@ -45,7 +45,8 @@ cross:
 	done
 
 run: build
-	./$(BINARY)$(EXE) --config configs/grima.example.toml
+	@cfg=grima.toml; [ -f $$cfg ] || cfg=configs/grima.example.toml; \
+	echo "running with $$cfg"; ./$(BINARY)$(EXE) --config $$cfg
 
 clean:
 	rm -rf $(BINARY)$(EXE) $(DIST)
