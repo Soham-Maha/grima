@@ -10,12 +10,23 @@ endif
 
 PLATFORMS := linux/amd64 linux/arm64 windows/amd64 darwin/arm64
 
+# Set as a make variable rather than a `NAME=value` prefix on the recipe line.
+# A make on Windows (chocolatey's, for instance) runs recipes through cmd.exe,
+# where that prefix is a syntax error — and `make build` failing on the first
+# command a Windows user types is a poor introduction. Exported variables reach
+# the recipe's environment under cmd, sh and PowerShell alike.
+export CGO_ENABLED := 0
+
+# Evaluated when make starts, so the check itself needs no shell beyond running
+# gofmt, which ships with Go.
+FMT_BAD := $(shell gofmt -l .)
+
 .PHONY: all build test race vet fmt fmt-check lint cross run clean
 
 all: build
 
 build:
-	CGO_ENABLED=0 go build -trimpath -o $(BINARY)$(EXE) $(CMD)
+	go build -trimpath -o $(BINARY)$(EXE) $(CMD)
 
 test:
 	go test ./...
@@ -30,10 +41,17 @@ fmt:
 	gofmt -l -w .
 
 fmt-check:
-	@out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "not gofmt-clean:"; echo "$$out"; exit 1; fi
+ifneq ($(FMT_BAD),)
+	@echo "not gofmt-clean:"
+	@echo "$(FMT_BAD)"
+	@exit 1
+endif
+	@echo "gofmt clean"
 
 lint: fmt-check vet
 
+# POSIX shell only: the loop and the variable expansion below are sh syntax.
+# On Windows run it from Git Bash, or use the direct go commands in the README.
 cross:
 	@mkdir -p $(DIST)
 	@for p in $(PLATFORMS); do \
@@ -41,12 +59,16 @@ cross:
 		out=$(DIST)/$(BINARY)-$$os-$$arch; \
 		if [ "$$os" = "windows" ]; then out=$$out.exe; fi; \
 		echo "building $$out"; \
-		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "-s -w" -o $$out $(CMD) || exit 1; \
+		GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "-s -w" -o $$out $(CMD) || exit 1; \
 	done
 
-run: build
-	@cfg=grima.toml; [ -f $$cfg ] || cfg=configs/grima.example.toml; \
-	echo "running with $$cfg"; ./$(BINARY)$(EXE) --config $$cfg
+# Resolved by make, not by a shell test, so this works under cmd as well as sh.
+CFG := $(if $(wildcard grima.toml),grima.toml,configs/grima.example.toml)
 
+run: build
+	@echo "running with $(CFG)"
+	./$(BINARY)$(EXE) --config $(CFG)
+
+# POSIX shell only: `rm -rf`. On Windows delete the binary and dist/ directly.
 clean:
 	rm -rf $(BINARY)$(EXE) $(DIST)

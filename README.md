@@ -237,8 +237,20 @@ Four PowerShell-specific traps:
 | `python3` is a Microsoft Store stub that succeeds and then does nothing | use `python` |
 | Environment variables are `$env:NAME="value"`, not `NAME=value cmd` | `$env:CGO_ENABLED="0"; go build …` |
 
-`make` is used throughout these docs; if it is not installed, every target has a direct
-equivalent (`go build`, `go test`, `go vet`, `gofmt -l .`).
+`make` is used throughout these docs. `build`, `test`, `race`, `vet`, `fmt`, `fmt-check`,
+`lint` and `run` work under PowerShell and `cmd` as well as a POSIX shell — the recipes use
+no shell-specific syntax and `CGO_ENABLED=0` is exported by make rather than prefixed on the
+command line. **`cross` and `clean` are POSIX-only** (a shell loop, and `rm -rf`); run those
+from Git Bash, or use the direct equivalents:
+
+```powershell
+$env:CGO_ENABLED="0"
+$env:GOOS="linux"; $env:GOARCH="amd64"; go build -trimpath -o dist/grima-linux-amd64 ./cmd/grima
+Remove-Item grima.exe, dist -Recurse -Force
+```
+
+If `make` is not installed at all, every target has a direct equivalent (`go build`,
+`go test`, `go vet`, `gofmt -l .`).
 
 ### Everything else
 
