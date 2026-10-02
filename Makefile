@@ -10,12 +10,13 @@ endif
 
 PLATFORMS := linux/amd64 linux/arm64 windows/amd64 darwin/arm64
 
-# Set as a make variable rather than a `NAME=value` prefix on the recipe line.
-# A make on Windows (chocolatey's, for instance) runs recipes through cmd.exe,
-# where that prefix is a syntax error — and `make build` failing on the first
-# command a Windows user types is a poor introduction. Exported variables reach
-# the recipe's environment under cmd, sh and PowerShell alike.
-export CGO_ENABLED := 0
+# Set per target rather than globally, and as a make variable rather than a
+# `NAME=value` prefix on the recipe line. A make on Windows (chocolatey's, for
+# instance) runs recipes through cmd.exe, where that prefix is a syntax error —
+# and `make build` failing on the first command a Windows user types is a poor
+# introduction. Target-specific export reaches the recipe's environment under
+# cmd, sh and PowerShell alike, and leaves `race` alone: `go test -race` needs
+# cgo, so a global CGO_ENABLED=0 breaks it.
 
 # Evaluated when make starts, so the check itself needs no shell beyond running
 # gofmt, which ships with Go.
@@ -25,6 +26,7 @@ FMT_BAD := $(shell gofmt -l .)
 
 all: build
 
+build: export CGO_ENABLED := 0
 build:
 	go build -trimpath -o $(BINARY)$(EXE) $(CMD)
 
@@ -52,6 +54,7 @@ lint: fmt-check vet
 
 # POSIX shell only: the loop and the variable expansion below are sh syntax.
 # On Windows run it from Git Bash, or use the direct go commands in the README.
+cross: export CGO_ENABLED := 0
 cross:
 	@mkdir -p $(DIST)
 	@for p in $(PLATFORMS); do \
