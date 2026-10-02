@@ -362,6 +362,27 @@ tar czf /tmp/a.tgz <big-tree>    # high-entropy output — the 7-Zip problem
 ffmpeg -i in.mp4 -c:v libx264 out.mp4
 ```
 
+### Running the scripted corpus
+
+`testdata/scenarios/benign-fp-check.sh <scenario>` captures a baseline against one workload,
+runs that workload again as the measured pass, and prints the verdict with its signals. It
+exits non-zero when the workload alerted, so it composes:
+
+```sh
+testdata/scenarios/benign-fp-spread.sh -n 3 testdata/scenarios/benign-npm-install.sh
+```
+
+The calibration window is sized from a timed pass (one extra workload run) rather than a
+constant. A window shorter than one pass leaves that pass's own late writes — and therefore
+their extensions — outside the baseline, and the measured pass then reports them as
+first-seen novelty, which is a harness defect that reads exactly like a detector false
+positive. `GRIMA_FP_WARMUP` overrides the window; the script header lists the rest.
+
+On Windows, run these under **Git Bash**, not WSL. The detector is a Windows binary and the
+fixtures are handed Windows paths, so a WSL work root (`//wsl.localhost/...`) is not a
+directory it can watch. Both scripts fail fast when the work root is not drive-lettered
+rather than reporting an empty baseline after two minutes.
+
 **Expected:** zero `high`/`critical` verdicts. `medium` verdicts on `tar`/`ffmpeg` output
 are the known hard case — high entropy from a legitimate compressor. If they fire, the
 fix is a per-extension entropy prior plus a magic-byte check, **not** raising the global

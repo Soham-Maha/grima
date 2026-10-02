@@ -27,8 +27,9 @@ phases are; this says *who does what, in what order, and how we know it is finis
 18. [Two Weight-Table Problems The Ablation Must Price](#18-two-weight-table-problems-the-ablation-must-price)
 19. [The Atomic-Save False Positive](#19-the-atomic-save-false-positive)
 20. [Host Mode: Where Evidence Is Filed](#20-host-mode-where-evidence-is-filed)
-21. [The npm False Positive, and One Unreproduced Claim](#21-the-npm-false-positive-and-one-unreproduced-claim)
+21. [The npm False Positive, and One Claim That Reproduced Later](#21-the-npm-false-positive-and-one-claim-that-reproduced-later)
 22. [The `max_delay` Curve, and a Coupling It Exposed](#22-the-max_delay-curve-and-a-coupling-it-exposed)
+23. [Sprint 2 Close-Out: An Amended Criterion, Three Harness Defects, One Deadlock](#23-sprint-2-close-out-an-amended-criterion-three-harness-defects-one-deadlock)
 
 ---
 
@@ -174,7 +175,7 @@ alert names the right process, or show the measured accuracy number that explain
 | # | Item | WS | Exit criterion |
 |---|---|---|---|
 | 2.1 | **Resolve the n-gram gap** | W2 | Either an n-gram signal is computed from the ring and appears in verdicts, or the claim and `window.ngram_length` are deleted. No third option |
-| 2.2 | Drip-encryption validation | W2 | `encryptor.py --rate drip` (1 file / 5s) crosses threshold on the cumulative track while the decaying window stays flat |
+| 2.2 | Drip-encryption validation | W2 | `encryptor.py --rate drip` (1 file / 5s) crosses threshold. **Amended at close** — the original second clause ("while the decaying window stays flat") assumed per-process filing. Under the shipped `host` aggregation the window sees every event, so the clause is unmeetable as written, and re-measuring it under `audit` would only demonstrate a configuration we do not deploy. The cumulative track's ability to carry a verdict *alone* is demonstrated instead by `rates.sh quiet-drip`, where every window signal is absent |
 | 2.3 | Intermittent-encryption validation | W2 | `--rate intermittent` detected; confirm the tail sample is what catches it |
 | 2.4 | Calibration round-trip | W2 | Baseline saved, reloaded, `calibration_ready: true`; a stale baseline is rejected |
 | 2.5 | Recalibration feedback | W2 | An operator-confirmed benign workload stops alerting after recalibration |
@@ -197,23 +198,24 @@ results were surprising, not because the sprint finished short.
 | # | Item | Result |
 |---|---|---|
 | 2.1 | n-gram gap | ✅ **Done.** Implemented rather than deleted: `ngram_rename_chain` is signal #14 and appears in live verdicts. Its limits are measured in §17. |
-| 2.2 | Drip validation | ⚠️ **Half met.** Drip is now **detected** at critical where it previously produced no alert, but the criterion's second clause fails: the window did not stay flat, so the cumulative track is not what carries it. Restated in §20. |
-| 2.3 | Intermittent validation | ⚠️ **Unverified.** A head/tail fixture exists; no result demonstrates the tail sample was the carrier. |
+| 2.2 | Drip validation | ✅ **Done, criterion amended.** Drip is detected at critical where it previously produced no alert (§20). The amended clause's demonstration is `rates.sh quiet-drip` on `6329324`: the same 1-file-per-5s rate, fixtures carrying no window-visible content, first verdict `info 6.0` below the band, later verdict **45.9 medium** on `(host)` — the only signals present are the cumulative pair `unknown_extension_activity=0.480` and `cum_bytes_rewritten=0.094`, with `write_burst`, `entropy_deviation`, `magic_mismatch`, `rename_burst`, `delete_rate` and `dir_fanout` absent from every verdict. The cumulative track carries a verdict alone. See §23. |
+| 2.3 | Intermittent validation | ✅ **Done.** Both halves measured on `6329324` with `rates.sh intermittent tail`, all checks passing. Intermittent: **100.0 critical** on `(host)`, `entropy_deviation=1.000`, `magic_mismatch=1.000`, `ngram_rename_chain=1.000`, 36 alerts. Tail: the fixture reports head entropy 4.16 (z=1.22 → signal 0.204, below the band) against head+tail 6.84 (z=7.51 → saturated), and the detector reaches **94.1 critical** with `entropy_deviation=0.941` and `magic_mismatch` **absent** — the untouched head is why magic still matches, so the tail half is the carrier. See §23. |
 | 2.4 | Calibration round-trip | ✅ **Done.** Verified both directions through a real detector, including the stale-baseline path. |
 | 2.5 | Recalibration feedback | ✅ **Done.** Implemented, `--recalibrate` wired, before/after proven through the real scorer. |
 | 2.6 | Tree aggregation under a real split | ✅ **Done, under per-process attribution** — the only configuration where it can be met. Split workload measured: tree 63.2 medium while each child stays silent. See §20. |
 | 2.7 | Fingerprint memory bound | ✅ **Done.** Ring wrap and 500×20 start/exit cycles pinned. |
-| 2.8 | Benign corpus | ✅ **Met**, with a deviation: npm measured at 50 packages rather than 200, because the scripted default could not be measured at all. Four of five workloads silent; **npm is a genuine false positive** (§21). |
+| 2.8 | Benign corpus | ✅ **Met.** npm now runs at its scripted default of **200 packages** — the configuration that previously could not be measured at all — and is **silent** (peak 21.7 low, zero alerts) once the calibration window covers a whole pass; the other four workloads were already silent. The extension-novelty behaviour behind the earlier npm alert is unchanged and belongs to 4.10. See §21 and §23. |
 | 2.9 | `max_delay` tuning | ✅ **Done.** Curve measured on an elevated host; default set to 500 ms, the best point, and the delay/window coupling bounded. See §22. |
 | 2.10 | Report spread, not one figure | ✅ **Done.** `benign-fp-spread.sh` reports N-round spread. |
 | 2.11 | Re-baseline smoke thresholds | ✅ **Done.** Assertions tightened in both smoke scripts. |
 
-**Ten met, one half, one unverified.** Every item that can be closed without external
-input is closed.
+**All eleven met, one against an amended criterion.** 2.2's original second clause could not
+be satisfied by any configuration we ship (§23), so the criterion was rewritten to say what
+the detector actually does rather than re-measuring a mode we retired.
 
 **Two things this table records that the sprint would otherwise have hidden.** 2.2's criterion
-was met in outcome and not in mechanism, and the honest reading is in §20 rather than a tick.
-2.8 met its criterion while finding a false positive, which is the corpus doing its job — a
+was met in outcome and not in mechanism, and the honest reading is in §20 and §23 rather than a
+tick. 2.8 met its criterion while finding a false positive, which is the corpus doing its job — a
 benign-corpus item that reports no false positives has probably not been run.
 
 ---
@@ -1362,11 +1364,11 @@ implying it holds by default.
 
 ---
 
-## 21. The npm False Positive, and One Unreproduced Claim
+## 21. The npm False Positive, and One Claim That Reproduced Later
 
 ### npm alerts at critical on a benign install
 
-The benign corpus found a second false positive, and it is reproducible: **3 of 3 spread
+The benign corpus found a second false positive, and it was reproducible: **3 of 3 spread
 rounds at 100.0 critical**, 12–13 alert lines each.
 
 ```
@@ -1374,7 +1376,7 @@ signals="delete_rate=1.000; unknown_extension_activity=1.000; entropy_deviation=
 ```
 
 **The root cause is a harness artifact, and it is worth being precise about which part is
-which.** The harness calibrates for 15 s, but one npm pass takes 22 s. npm's temp-file rename
+which.** The harness calibrated for 15 s, but one npm pass takes 22 s. npm's temp-file rename
 loop runs at the *end* of the pass — outside the window — so that run's baseline recorded
 `known_ext = [.js, .json, .md]` with no `.tmp` and no `.log`. The measured pass then writes
 ~60 files with those extensions, and `unknown_extension_activity` counts them as novel and
@@ -1396,13 +1398,29 @@ difference is whether calibration saw the workload.
 Reporting it as "npm is a false positive, cause unknown" would have been wrong, and so would
 treating it as purely a harness bug. It is both, and the split matters.
 
+**Resolution (§23).** The harness half is fixed: the calibration window is now sized from a
+timed pass, and the same workload at its scripted default — **200 packages, which previously
+"could not be measured at all"** — is silent.
+
+```
+baseline written ... extensions=4 processes=0
+observed: calibration_ready=True filewatch_events=9234 filewatch_reporting=True
+score=21.7 level=low pid=0 proc=(host) signals=rename_burst=0.186; entropy_deviation=0.081
+alerts=0
+```
+
+The baseline now carries four extensions instead of three — `.tmp` and `.log` are learned —
+and the workload peaks at **21.7 low with zero alerts**. The behaviour half is unchanged and
+still belongs to item 4.10: a first-seen extension can still alert on its own, and a workload
+that writes an extension calibration never saw is still the class that prices it.
+
 ### Atomic-save is now silent
 
 The same run measured the workload from §19 at **peak 20 (info), zero alerts** — down from
 56.6 medium, then 45.1 medium. Host mode plus the weight fixes removed it. The open defect in
 §19 is closed by the §20 change, not by tuning the band.
 
-### A claim I could not reproduce
+### A claim that was not reproduced here, and later was
 
 The agent reported that `filewatch.Start` "never returns" on a 403-directory tree. I tested
 **401 directories** and **1041 directories**:
@@ -1416,6 +1434,12 @@ Both start in well under a second. **Not reproduced.** It may have been specific
 tree's shape — `node_modules` contains symlinks and deep nesting — or a misreading of a slow
 run. Recorded as unreproduced rather than dismissed, because a sensor that can hang is a
 fail-safe violation and worth a targeted test if anyone sees it again.
+
+**Resolution (§23): the report was right.** It reproduced on a 403-directory tree that was
+being written to while the detector started, and it is a deadlock in `filewatch`'s watch
+registration — fsnotify's `Add` waits for its backend reader, and that reader waits for a
+consumer that `Start` had not started yet. The two tests here passed because nothing was
+writing to those trees. Fixed, with a regression test that fails on the pre-fix code.
 
 ---
 
@@ -1486,3 +1510,167 @@ mechanism. It happened to be reasonable, but it was not chosen from a measuremen
 measurement shows it leaves 1.6 points on the table while a value one step further would have
 been actively harmful. **A parameter that looks like a latency knob was also a correctness
 knob**, and only a sweep showed that.
+
+---
+
+## 23. Sprint 2 Close-Out: An Amended Criterion, Three Harness Defects, One Deadlock
+
+Closing 2.2 and 2.3 took one amended exit criterion, three defects in the measurement
+harness, and one observation that belongs in the record. All figures below were taken on
+`6329324`, the commit the sprint closed on.
+
+### 2.2 — the clause assumed a configuration we no longer ship
+
+The original criterion required the drip to cross the threshold "on the cumulative track
+while the decaying window stays flat". That was written for per-process filing, where a slow
+drip spreads thin across a window. Under the `host` filing default that shipped in §20 the
+window sees every event, so the clause is unmeetable as written — and re-measuring it under
+`attribution.mode = "audit"` would only demonstrate a configuration the detector does not
+deploy. The criterion was amended to say what the shipped detector does, and the property the
+old clause was reaching for is demonstrated separately by `rates.sh quiet-drip`.
+
+That phase runs the same 1-file-per-5s rate with fixtures that carry no window-visible
+content, so the cumulative track is the only track that can fire:
+
+| | Value |
+|---|---|
+| First verdict | `info`, 6.0 — below the band |
+| Later verdict | **45.9 medium** on `(host)` |
+| Signals present | `unknown_extension_activity=0.480`, `cum_bytes_rewritten=0.094` |
+| Signals absent from every verdict | `write_burst`, `entropy_deviation`, `magic_mismatch`, `rename_burst`, `delete_rate`, `dir_fanout` |
+
+**The cumulative track carries a verdict alone.** That is a stronger statement than the
+original clause, which only asked that the window not be the carrier.
+
+### 2.3 — the tail half is the carrier
+
+`rates.sh intermittent tail` measures both halves, and both now pass:
+
+| Phase | Result |
+|---|---|
+| intermittent | **100.0 critical** on `(host)`; `entropy_deviation=1.000`, `magic_mismatch=1.000`, `ngram_rename_chain=1.000`, `unknown_extension_activity=0.800`; 36 alerts |
+| tail | fixture: head 4.16 → z=1.22 → signal **0.204** (below the band); head+tail 6.84 → z=7.51 → **saturated** |
+
+The tail phase's detector verdict is **94.1 critical** with `entropy_deviation=0.941` and
+`magic_mismatch` **absent**. The absence is the proof: the fixture overwrites only the last
+4 KiB, so the head still carries the `%PDF-1.7` magic while the sensor's head+tail sample
+reads 6.84 bits/byte against a baseline of 3.639. The head half alone would not have crossed
+the band (0.204), so the sample's tail half is what catches it.
+
+### A startup stall, reproduced and root-caused
+
+§21 recorded, as unreproduced, a report that `filewatch.Start` "never returns" on a
+403-directory tree; it was tested against 401 and 1041 directories and started in under a
+second both times. **It happened again during this close-out, at 403 directories, and this
+time it reproduced on demand.**
+
+The false-positive harness's calibration detector sat for **4 m 43 s** after
+`platform detected` with no further log line — `watching directories` never appeared, which
+places the stall inside `filewatch.Start`'s tree walk. It was killed by hand. The identical
+tree, immediately afterwards and with the host idle, started in **32 ms**. Then the harness
+was re-run, and the same tree hung again — this time the harness's new bounded wait caught
+it, and a standalone run reproduced the hang with nothing else on the host:
+
+```
+time=... level=INFO msg="platform detected" os=windows
+(no further output; killed at 45 s)
+```
+
+**The cause is a deadlock in the watch registration, not a slow machine.** A probe that
+times `watcher.Add` per directory produced the runtime's own verdict:
+
+```
+... 150 dirs, 14.05ms elapsed
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [chan receive]:
+  fsnotify.(*readDirChangesW).AddWith(...)   backend_windows.go:145
+  main.main.func1(...)                        probe-addtree/main.go:29
+goroutine 8 [select, locked to thread]:
+  fsnotify.(*readDirChangesW).sendEvent(...)  backend_windows.go:76
+  fsnotify.(*readDirChangesW).readEvents(...) backend_windows.go:642
+```
+
+fsnotify's Windows `Add` sends the request to the backend and then waits for a reply on a
+channel (`<-in.reply`). The backend's reader goroutine is the one that answers — and it
+blocks while an event is waiting to be consumed (`sendEvent`, on a bounded `Events` channel).
+`Start` registered every watch *before* starting the goroutine that consumes events, so on a
+tree that is being written to, the reader filled the event buffer and stopped answering,
+while `Start` waited for an answer. Neither side could move.
+
+That explains every observation: the idle tree starts in milliseconds (no events, nothing to
+block on), the count of directories is incidental (it only sets how long the window is open),
+and §21's 401- and 1041-directory tests passed because nothing was writing to those trees.
+
+**Fixed in `internal/sensor/filewatch`:**
+
+1. **The consumer starts before the first watch is added.** The event channel always has a
+   reader, so the reader can always answer an `Add`.
+2. **Directories discovered at runtime are queued, not added inline.** The event loop is the
+   only consumer of the events that `Add` waits behind, so calling `Add` from inside it is the
+   same deadlock one directory later. A worker goroutine owns those adds; a full queue
+   (256) is counted as `add_dropped` and surfaced through `/healthz`, per the invariant that a
+   bounded queue never drops silently.
+
+**Verified three ways.** The probe above deadlocks on the old code and completes on the new
+one. A regression test (`TestStartReturnsWhileTheTreeIsBeingWritten`, a 300-directory tree
+written to while `Start` walks it) fails on the pre-fix code with *"Start did not return while
+the tree was being written: the watch registration deadlocked"* and passes with the fix; a
+second test covers the runtime-added-directory path. And the tree that hung for 45 s+ now
+starts in **56 ms** (`platform detected` 14:21:32.290, `watching directories count=403`
+14:21:32.346).
+
+**What this says about the method.** The original report was correct and was recorded as
+"unreproduced" — which was the right thing to write at the time, because it had been tested
+twice on idle trees and started fast both times. The reproduction only became possible when
+the harness began writing to the tree *while* the detector started, which is what a real
+deployment does. A hang that needs load to appear will not show up in a quiet test.
+
+### The npm false positive is gone, and the harness was half of it
+
+§21 split npm's 100/critical alert into a harness defect (a 15 s calibration window against a
+69 s workload pass) and a real behaviour (a first-seen extension alerting alone, §18). The
+harness half is now fixed, and the workload is silent at its scripted default:
+
+| | Before | After |
+|---|---|---|
+| Packages | 50 (200 could not be measured) | **200** |
+| Baseline extensions | 3 — `.tmp` and `.log` unlearned | **4** |
+| Peak verdict | 100.0 critical, 12–13 alerts | **21.7 low, 0 alerts** |
+
+`rename_burst=0.186` and `entropy_deviation=0.081` are the only signals left. The behaviour
+half is unchanged: a workload that writes an extension calibration never saw still alerts on
+its own, which is exactly what item 4.10 exists to price.
+
+### The harness defects this exposed
+
+Measuring on a busy host found three defects in the measurement instrument itself, all fixed:
+
+1. **A calibration window shorter than one workload pass.** The window was a fixed 15 s while
+   one npm pass takes 69 s, so the pass's own late writes — the temp-file rename loop lands in
+   its final seconds — fell outside the baseline and their extensions came back as first-seen
+   novelty in the measured pass. This is the harness half of §21's false positive. The window
+   is now sized from a timed pass (`GRIMA_FP_WARMUP` overrides it).
+2. **`pick_python` proved nothing.** It accepted a candidate that satisfied `-c 'import sys'`,
+   which the Windows Store `python3` stub does before failing to open any script. It now
+   requires the candidate to evaluate and print a value.
+3. **An unbounded wait.** The harness waited on the calibration process forever, so a stalled
+   detector produced no output at all instead of a diagnosis. The wait is now bounded and the
+   stall is reported with the detector's last log lines.
+
+A work-root guard was added alongside them: under WSL, `/tmp` converts to a
+`//wsl.localhost/...` path the detector cannot watch, and the run then reported an empty
+baseline and a dead sensor instead of a misconfigured path. Both harnesses now fail fast on a
+work root that is not drive-lettered. `rates.sh` also pins `attribution.mode` rather than
+inheriting the default, so a future change to the default cannot silently re-point every
+measurement underneath it.
+
+### Provenance
+
+The three-phase rates run and the false-positive run were both taken with the repository's own
+scripts, under Git Bash, against `grima.exe` built from `6329324`. Raw output is in
+`.sprint2/RateScenarios/rerun/` (scratch, gitignored). One caveat on the raw tail-phase output:
+a concurrently running subagent's end-to-end test had a process whose command line matched
+`R-EVENTLOG-CLEAR`, so the series also contains `critical score=0.0` override verdicts naming
+`python.exe`. Those are that test's artifact, not the fixture's — the entropy evidence the
+phase asserts is a separate verdict line and is unaffected.
