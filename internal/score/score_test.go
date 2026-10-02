@@ -374,3 +374,46 @@ func TestNGramRenameChainReachesTheVerdict(t *testing.T) {
 		t.Fatalf("write-only activity produced an n-gram signal: %s", sg.Detail)
 	}
 }
+
+// Bus drops are their own signal rather than a silent loss: a storm that outran
+// the bus must show up in the verdict it corrupted, not only in a log line.
+func TestBusDropsSurfaceAsTheirOwnSignal(t *testing.T) {
+	scorer := NewScorer(config.Default())
+
+	verdict := scorer.Evaluate(Inputs{Tree: encryptedTree(), Baseline: testBaseline(), BusDropped: 500})
+
+	var seen bool
+	for _, sg := range verdict.Signals {
+		if sg.Name != "bus_drops" {
+			continue
+		}
+		seen = true
+		if sg.Class != ClassSecondary {
+			t.Errorf("bus_drops class = %v, want secondary", sg.Class)
+		}
+		if sg.Value < 0.49 || sg.Value > 0.51 {
+			t.Errorf("bus_drops value = %v, want 500/1000", sg.Value)
+		}
+		if !strings.Contains(sg.Detail, "500") {
+			t.Errorf("bus_drops detail = %q, want the count", sg.Detail)
+		}
+	}
+	if !seen {
+		t.Fatalf("no bus_drops signal for 500 dropped events; got %v", verdict.Signals)
+	}
+}
+
+// Sad path: no drops must not produce the signal, and a handful of drops is
+// below the noise floor rather than evidence of a storm.
+func TestBusDropsBelowTheNoiseFloorAreNotEvidence(t *testing.T) {
+	scorer := NewScorer(config.Default())
+
+	for _, dropped := range []uint64{0, 10} {
+		verdict := scorer.Evaluate(Inputs{Tree: encryptedTree(), Baseline: testBaseline(), BusDropped: dropped})
+		for _, sg := range verdict.Signals {
+			if sg.Name == "bus_drops" {
+				t.Fatalf("bus_drops present with %d drops (value %v)", dropped, sg.Value)
+			}
+		}
+	}
+}

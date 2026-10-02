@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -223,5 +224,68 @@ func TestPublishThrottlesAlertsPerIncident(t *testing.T) {
 				t.Fatalf("alerts = %d, want %d\n%s", got, tc.want, buf.String())
 			}
 		})
+	}
+}
+
+// A write storm that outruns the bus must be visible where an operator looks:
+// the drop counter in health, and the verdict the lost events would have shaped.
+// This drives a real bus, a real engine and the real score loop.
+func TestWriteStormSurfacesDropsInHealthAndVerdicts(t *testing.T) {
+	cfg := config.Default()
+	cfg.Bus.Capacity = 8
+	cfg.Scoring.AbsoluteWriteRate = 1
+	log := slog.New(slog.DiscardHandler)
+
+	events := bus.New(cfg.Bus.Capacity, bus.DropOldest)
+	defer events.Close()
+
+	// Nothing consumes this bus, so it fills and the rest is dropped.
+	for range 500 {
+		events.Publish(event.Event{Kind: event.KindFileWrite, Path: "/data/a.txt", Time: time.Now()})
+	}
+	dropped := events.Stats().Dropped
+	if dropped == 0 {
+		t.Fatal("the storm dropped nothing; the test measured nothing")
+	}
+
+	engine := fingerprint.NewEngine(cfg)
+	for range 50 {
+		engine.Apply(event.Event{
+			Kind: event.KindFileWrite, Path: "/data/a.txt", Time: time.Now(),
+			PID: 4242, ProcName: "cryptor",
+		})
+	}
+
+	hub := web.NewHub(func() web.Health { return web.Health{} })
+	loop := scoreLoop{
+		cfg:       cfg,
+		events:    events,
+		engine:    engine,
+		scorer:    score.NewScorer(cfg),
+		overrides: newOverrideTracker(cfg.Window.DecayHalfLife.Std()),
+		responder: response.NewHandler(cfg, log),
+		hub:       hub,
+		log:       log,
+	}
+	loop.evaluate()
+
+	var found bool
+	for _, v := range hub.Latest() {
+		for _, sg := range v.Signals {
+			if sg.Name == "bus_drops" {
+				found = true
+				if !strings.Contains(sg.Detail, strconv.FormatUint(dropped, 10)) {
+					t.Errorf("bus_drops detail = %q, want the count %d", sg.Detail, dropped)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no verdict carried the drop count (%d dropped); verdicts: %v", dropped, hub.Latest())
+	}
+
+	health := healthSnapshot(time.Now(), events, nil, engine, nil)
+	if health.BusDropped != dropped {
+		t.Errorf("health bus_dropped = %d, want %d", health.BusDropped, dropped)
 	}
 }
