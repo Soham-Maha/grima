@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/event"
 )
 
 var errSourceUnavailable = errors.New("source unavailable")
@@ -76,6 +77,26 @@ func TestConfigureWithNoLoggerDoesNotPanic(t *testing.T) {
 func TestConfigureNilAttributorIsSafe(t *testing.T) {
 	var a *Attributor
 	a.Configure(config.AttributionConfig{Mode: config.AttributionAudit}, nil, testLogger())
+}
+
+// The shipped default for the failure table's ambiguous-attribution row: host
+// mode makes no per-process claim, so two competing writers cannot put a wrong
+// PID on the event. The evidence aggregates on the host (PID 0) fingerprint
+// instead of being split across a guess.
+func TestHostModeFilesAgainstTheHostFingerprint(t *testing.T) {
+	a := New(time.Second)
+	a.Configure(config.AttributionConfig{Mode: config.AttributionHost}, []string{`C:\data`}, testLogger())
+
+	a.Observe(11, "heavy", 0, `C:\Tools\heavy.exe`, 9000)
+	a.Observe(22, "light", 0, `C:\Tools\light.exe`, 1000)
+
+	recorder := newEmitRecorder(1)
+	a.Resolve(event.Event{Kind: event.KindFileWrite, Path: `C:\data\a.txt`, Time: time.Now()}, recorder.emit)
+
+	emitted := recorder.wait(t)
+	if emitted[0].PID != 0 {
+		t.Fatalf("pid = %d, want 0: host mode must not blame a process", emitted[0].PID)
+	}
 }
 
 func TestCausalWindowIsWiderThanTheDelay(t *testing.T) {

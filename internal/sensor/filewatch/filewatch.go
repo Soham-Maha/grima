@@ -55,6 +55,12 @@ type Source struct {
 	dropped  atomic.Uint64
 	overflow atomic.Uint64
 	rescans  atomic.Uint64
+
+	// watchFailures counts directories that ended up unmonitored: an Add the
+	// kernel refused (inotify watch exhaustion), an unreadable subtree, or an
+	// overflow that lost notifications. It is the number behind the failure
+	// table's "count and surface watch exhaustion".
+	watchFailures atomic.Uint64
 }
 
 // New returns a file sensor.
@@ -91,7 +97,7 @@ func (s *Source) Start(ctx context.Context, out chan<- event.Event) error {
 
 	watched := 0
 	for _, root := range s.cfg.General.MonitorPaths {
-		n, err := addTree(watcher, root)
+		n, err := s.addTree(watcher, root)
 		if err != nil {
 			s.log.Warn("partial watch", "path", root, "error", err)
 		}
@@ -131,6 +137,7 @@ func (s *Source) Stats() sensor.Stats {
 		Extra: map[string]uint64{
 			"overflow":            s.overflow.Load(),
 			"rescans":             s.rescans.Load(),
+			"watch_failures":      s.watchFailures.Load(),
 			"add_dropped":         s.addDropped.Load(),
 			"attrib_causal_hits":  attribution.CausalHits,
 			"attrib_correlate":    attribution.CausalMisses,
@@ -162,7 +169,7 @@ func (s *Source) addWorker(ctx context.Context) {
 		case <-s.done:
 			return
 		case path := <-s.addQueue:
-			if _, err := addTree(s.watcher, path); err != nil {
+			if _, err := s.addTree(s.watcher, path); err != nil {
 				s.log.Warn("partial watch", "path", path, "error", err)
 			}
 		}
@@ -198,8 +205,14 @@ func (s *Source) handleWatchError(err error, out chan<- event.Event) {
 	s.errors.Add(1)
 	s.log.Warn("watch error", "source", name, "error", err)
 
-	if isOverflow(err) && s.cfg.FileWatch.RescanOnOverflow {
-		s.overflow.Add(1)
+	if !isOverflow(err) {
+		return
+	}
+	// An overflow lost notifications whether or not the compensating rescan is
+	// enabled, so it is both an overflow and a watch failure either way.
+	s.overflow.Add(1)
+	s.watchFailures.Add(1)
+	if s.cfg.FileWatch.RescanOnOverflow {
 		s.rescan(out)
 	}
 }
@@ -309,13 +322,16 @@ func isOverflow(err error) bool {
 }
 
 // addTree watches root and every subdirectory under it, skipping subtrees it
-// cannot read rather than failing the whole watch.
-func addTree(watcher *fsnotify.Watcher, root string) (int, error) {
+// cannot read rather than failing the whole watch. Every directory that ends up
+// unwatched is counted, so inotify watch exhaustion shows up as a number on
+// /healthz rather than only as a log line.
+func (s *Source) addTree(watcher *fsnotify.Watcher, root string) (int, error) {
 	added := 0
 	var firstErr error
 
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			s.watchFailures.Add(1)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -325,6 +341,7 @@ func addTree(watcher *fsnotify.Watcher, root string) (int, error) {
 			return nil
 		}
 		if err := watcher.Add(path); err != nil {
+			s.watchFailures.Add(1)
 			if firstErr == nil {
 				firstErr = err
 			}

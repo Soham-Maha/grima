@@ -58,7 +58,9 @@ func TestStartReturnsWhileTheTreeIsBeingWritten(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start: %v", err)
 		}
-	case <-time.After(30 * time.Second):
+	// The pre-fix failure mode is a deadlock, so it never returns at all; the
+	// budget only has to be long enough not to fail a slow machine under load.
+	case <-time.After(60 * time.Second):
 		t.Fatal("Start did not return while the tree was being written: the watch registration deadlocked")
 	}
 	defer src.Close()

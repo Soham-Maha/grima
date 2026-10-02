@@ -31,6 +31,28 @@ func TestResolveCorrelatesWithoutACausalSource(t *testing.T) {
 	}
 }
 
+// The failure table's ambiguous-attribution row, correlate half: when several
+// processes are writing, the emitted event carries the top writer's share of
+// recent bytes as its confidence rather than a claim of certainty. The event is
+// still attributed and emitted; the confidence is what says the per-process
+// blame is weak.
+func TestResolveReportsLowConfidenceWhenWritersAreAmbiguous(t *testing.T) {
+	a := New(time.Second)
+	a.Observe(11, "heavy", 0, `C:\Tools\heavy.exe`, 9000)
+	a.Observe(22, "light", 0, `C:\Tools\light.exe`, 1000)
+
+	recorder := newEmitRecorder(1)
+	a.Resolve(event.Event{Kind: event.KindFileWrite, Path: `C:\data\a.txt`, Time: time.Now()}, recorder.emit)
+
+	emitted := recorder.wait(t)
+	if emitted[0].PID != 11 {
+		t.Fatalf("pid = %d, want the top writer 11", emitted[0].PID)
+	}
+	if c := emitted[0].AttribConfidence; c <= 0 || c >= 1 {
+		t.Fatalf("confidence = %v, want strictly between 0 and 1 for two writers", c)
+	}
+}
+
 // The point of the mechanism: a file event is blamed on the process the OS
 // reported, even when another process was writing more bytes.
 func TestResolveUsesTheCausalWriter(t *testing.T) {
