@@ -29,7 +29,7 @@ phases are; this says *who does what, in what order, and how we know it is finis
 20. [Host Mode: Where Evidence Is Filed](#20-host-mode-where-evidence-is-filed)
 21. [The npm False Positive, and One Claim That Reproduced Later](#21-the-npm-false-positive-and-one-claim-that-reproduced-later)
 22. [The `max_delay` Curve, and a Coupling It Exposed](#22-the-max_delay-curve-and-a-coupling-it-exposed)
-23. [Sprint 2 Close-Out: An Amended Criterion, Three Harness Defects, One Deadlock](#23-sprint-2-close-out-an-amended-criterion-three-harness-defects-one-deadlock)
+23. [Sprint 2 Close-Out: An Amended Criterion, Four Harness Defects, One Deadlock](#23-sprint-2-close-out-an-amended-criterion-four-harness-defects-one-deadlock)
 24. [The Cerberus Split: What Is Asserted, and What Is Only Measured](#24-the-cerberus-split-what-is-asserted-and-what-is-only-measured)
 
 ---
@@ -1538,9 +1538,9 @@ knob**, and only a sweep showed that.
 
 ---
 
-## 23. Sprint 2 Close-Out: An Amended Criterion, Three Harness Defects, One Deadlock
+## 23. Sprint 2 Close-Out: An Amended Criterion, Four Harness Defects, One Deadlock
 
-Closing 2.2 and 2.3 took one amended exit criterion, three defects in the measurement
+Closing 2.2 and 2.3 took one amended exit criterion, four defects in the measurement
 harness, and one observation that belongs in the record. All figures below were taken on
 `6329324`, the commit the sprint closed on.
 
@@ -1669,7 +1669,7 @@ its own, which is exactly what item 4.10 exists to price.
 
 ### The harness defects this exposed
 
-Measuring on a busy host found three defects in the measurement instrument itself, all fixed:
+Measuring on a busy host found four defects in the measurement instrument itself, all fixed:
 
 1. **A calibration window shorter than one workload pass.** The window was a fixed 15 s while
    one npm pass takes 69 s, so the pass's own late writes — the temp-file rename loop lands in
@@ -1682,6 +1682,12 @@ Measuring on a busy host found three defects in the measurement instrument itsel
 3. **An unbounded wait.** The harness waited on the calibration process forever, so a stalled
    detector produced no output at all instead of a diagnosis. The wait is now bounded and the
    stall is reported with the detector's last log lines.
+4. **`smoke.sh` could not run its own encryptor leg.** It resolved python with `command -v
+   python3`, which on Windows finds the Store stub — a command that resolves and then fails to
+   open any script. The smoke test therefore reported "encryptor fixture failed" and never
+   exercised detection end to end, while CI, which runs the Linux variant on a real python3,
+   stayed green. Found only because the smoke test was run here after the other harnesses were
+   fixed. Both smoke scripts now require the interpreter to evaluate and print a value.
 
 A work-root guard was added alongside them: under WSL, `/tmp` converts to a
 `//wsl.localhost/...` path the detector cannot watch, and the run then reported an empty

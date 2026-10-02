@@ -20,7 +20,23 @@ LOG="$WORK/grima.log"
 BINARY="${GRIMA_BINARY:-$ROOT/grima}"
 [ -x "$BINARY" ] || { echo "error: no binary at $BINARY; run 'make build' or set GRIMA_BINARY" >&2; exit 2; }
 
-PYTHON="$(command -v python3 || command -v python)" \
+# A python on PATH has to prove it evaluates code and prints the answer: a
+# resolver that only checks the command exists accepts a shim that then fails to
+# open any script.
+pick_python() {
+  local candidate got
+  for candidate in "$@"; do
+    [ -n "$candidate" ] || continue
+    got="$("$candidate" -c 'print(4**2)' 2>/dev/null | tr -d '\r')"
+    if [ "$got" = "16" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PYTHON="$(pick_python python3 python)" \
   || { echo "error: python3 is required for the fixtures" >&2; exit 2; }
 
 fail() { echo "FAIL: $*" >&2; [ -n "${KEEP_WORK:-}" ] || rm -rf "$WORK"; exit 1; }

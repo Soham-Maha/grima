@@ -50,7 +50,25 @@ BINARY="${GRIMA_BINARY:-$ROOT_SH/grima}"
 [ -x "$BINARY" ] || BINARY="$ROOT_SH/grima.exe"
 [ -x "$BINARY" ] || { echo "error: build grima first (make build), or set GRIMA_BINARY" >&2; exit 2; }
 
-PYTHON="${GRIMA_SMOKE_PYTHON:-$(command -v python3 || command -v python)}" \
+# A `python3` on PATH may be a Windows Store stub that prints an install message
+# and exits 0, so `command -v` proves nothing: the stub resolves, then fails to
+# open any script. Each candidate has to prove it evaluates code and prints the
+# answer, or the encryptor leg reports a fixture failure that is really a broken
+# interpreter.
+pick_python() {
+  local candidate got
+  for candidate in "$@"; do
+    [ -n "$candidate" ] || continue
+    got="$("$candidate" -c 'print(4**2)' 2>/dev/null | tr -d '\r')"
+    if [ "$got" = "16" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PYTHON="$(pick_python "${GRIMA_SMOKE_PYTHON:-}" python3 python)" \
   || { echo "error: python is required for the encryptor fixture" >&2; exit 2; }
 
 # A Windows detector driven by a POSIX interpreter over a DrvFs mount cannot
