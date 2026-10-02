@@ -31,6 +31,7 @@ func alertabilityBaseline() *calibrate.Baseline {
 		},
 		WriteRateByProc: map[string]float64{},
 		WriteRate:       calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
+		CreateRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		RenameRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		DeleteRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		FileEventRate:   calibrate.Dist{Mean: 20, StdDev: 2, N: 100},
@@ -79,6 +80,10 @@ func soloCases() []soloCase {
 		{
 			signal: "write_burst", class: ClassPrimary, weight: 1.0,
 			mutate: func(tv *fingerprint.TreeVector) { tv.Writes = 1200 }, // 40/s vs 5/s
+		},
+		{
+			signal: "create_burst", class: ClassPrimary, weight: 0.6,
+			mutate: func(tv *fingerprint.TreeVector) { tv.Creates = 1200 }, // 40/s vs 5/s
 		},
 		{
 			signal: "write_rate_absolute", class: ClassPrimary, weight: 1.0,

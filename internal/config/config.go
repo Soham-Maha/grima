@@ -193,6 +193,14 @@ var DefaultSignalWeights = []Weight{
 	{Name: "entropy_deviation", Weight: 1.0},
 	{Name: "magic_mismatch", Weight: 1.0},
 	{Name: "write_burst", Weight: 1.0},
+	// create_burst is a Primary, but a create-only burst is the weakest of the
+	// three burst shapes: an extractor, installer or restore creates thousands of
+	// files and writes nothing the window sees as a write. At 0.6 a saturated
+	// create burst reaches the medium band alone, which is why the calibration is
+	// the defence rather than the weight — a host where unpacking is normal has
+	// the create rate to match. Phase 6's ablation has to price it per scenario
+	// before the paper cites it, as it does for ngram_rename_chain.
+	{Name: "create_burst", Weight: 0.6},
 	{Name: "write_rate_absolute", Weight: 1.0},
 	{Name: "rename_burst", Weight: 0.8},
 	{Name: "ngram_rename_chain", Weight: 0.2},

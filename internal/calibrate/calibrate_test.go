@@ -521,3 +521,54 @@ func TestNilBaselineHasNoCoverage(t *testing.T) {
 		t.Fatalf("nil baseline coverage = %v, want nil", cov)
 	}
 }
+
+// Each per-kind rate counts one kind. Counting creates as writes made the
+// denominator a superset of the write signal's numerator, which halves the
+// apparent deviation of a create-heavy workload and makes the same workload
+// score differently under host and audit attribution. Creates get their own
+// rate, which is what create_burst compares against.
+func TestBaselineSplitsWritesFromCreates(t *testing.T) {
+	cfg := config.Default()
+	obs := NewObservations()
+	at := time.Now()
+
+	for range 10 {
+		obs.Observe(event.Event{Kind: event.KindFileWrite, Path: "/data/a.txt", Time: at})
+	}
+	for range 30 {
+		obs.Observe(event.Event{Kind: event.KindFileCreate, Path: "/data/b.txt", Time: at})
+	}
+
+	baseline := obs.Baseline(cfg, time.Minute)
+
+	if got := baseline.WriteRate.Mean; got != 10 {
+		t.Errorf("write rate = %v, want 10/s: creates must not be counted as writes", got)
+	}
+	if got := baseline.CreateRate.Mean; got != 30 {
+		t.Errorf("create rate = %v, want 30/s", got)
+	}
+	if got := baseline.FileEventRate.Mean; got != 40 {
+		t.Errorf("file event rate = %v, want 40/s", got)
+	}
+}
+
+// The create rate is a measured distribution like any other, so recalibration
+// has to pool it rather than drop it.
+func TestMergePoolsTheCreateRate(t *testing.T) {
+	existing := sampleBaseline()
+	existing.CreateRate = Dist{Mean: 4, StdDev: 1, N: 10}
+
+	fresh := sampleBaseline()
+	fresh.CreateRate = Dist{Mean: 8, StdDev: 1, N: 10}
+
+	if _, err := existing.Merge(fresh); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	if existing.CreateRate.N != 20 {
+		t.Fatalf("create rate samples = %d, want 20", existing.CreateRate.N)
+	}
+	if got := existing.CreateRate.Mean; got <= 4 || got >= 8 {
+		t.Fatalf("create rate mean = %v, want a pooled value between 4 and 8", got)
+	}
+}

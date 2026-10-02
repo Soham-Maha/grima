@@ -24,7 +24,7 @@ import (
 
 // Version is the baseline schema version. A baseline whose version does not
 // match is ignored rather than fatal.
-const Version = 2
+const Version = 3
 
 // Dist is a measured distribution.
 type Dist struct {
@@ -49,7 +49,14 @@ type Baseline struct {
 	// compared subset rates against it; on a host with 400 processes the
 	// baseline was dominated by process events, so write_burst and its siblings
 	// could never reach their threshold.
+	//
+	// Each rate counts one event kind and only that kind. WriteRate counts
+	// writes, not writes-plus-creates: the signal numerator counts writes, and
+	// a subset rate compared against a superset baseline is the same defect in
+	// the other direction — it halves the apparent deviation of a create-heavy
+	// workload and makes host and audit attribution disagree about it.
 	WriteRate     Dist `json:"write_rate"`
+	CreateRate    Dist `json:"create_rate"`
 	RenameRate    Dist `json:"rename_rate"`
 	DeleteRate    Dist `json:"delete_rate"`
 	FileEventRate Dist `json:"file_event_rate"`
@@ -89,6 +96,7 @@ func (b *Baseline) Coverage() map[string]int {
 	return map[string]int{
 		"entropy":     entropy,
 		"write_rate":  b.WriteRate.N,
+		"create_rate": b.CreateRate.N,
 		"rename_rate": b.RenameRate.N,
 		"delete_rate": b.DeleteRate.N,
 		"dir_fanout":  b.DirFanout.N,
@@ -126,6 +134,7 @@ func (b *Baseline) KnowsExt(ext string) bool {
 type secondCounts struct {
 	file   int
 	write  int
+	create int
 	rename int
 	delete int
 }
@@ -166,8 +175,10 @@ func (o *Observations) Observe(ev event.Event) {
 		counts := o.perSecond[second]
 		counts.file++
 		switch ev.Kind {
-		case event.KindFileWrite, event.KindFileCreate:
+		case event.KindFileWrite:
 			counts.write++
+		case event.KindFileCreate:
+			counts.create++
 		case event.KindFileRename:
 			counts.rename++
 		case event.KindFileDelete:
@@ -244,16 +255,19 @@ func (o *Observations) Baseline(cfg config.Config, elapsed time.Duration) *Basel
 
 	rates := make([]float64, 0, len(o.perSecond))
 	writes := make([]float64, 0, len(o.perSecond))
+	creates := make([]float64, 0, len(o.perSecond))
 	renames := make([]float64, 0, len(o.perSecond))
 	deletes := make([]float64, 0, len(o.perSecond))
 	for _, counts := range o.perSecond {
 		rates = append(rates, float64(counts.file))
 		writes = append(writes, float64(counts.write))
+		creates = append(creates, float64(counts.create))
 		renames = append(renames, float64(counts.rename))
 		deletes = append(deletes, float64(counts.delete))
 	}
 	bl.FileEventRate = distOf(rates)
 	bl.WriteRate = distOf(writes)
+	bl.CreateRate = distOf(creates)
 	bl.RenameRate = distOf(renames)
 	bl.DeleteRate = distOf(deletes)
 
@@ -395,6 +409,7 @@ func (b *Baseline) Merge(fresh *Baseline) (int, error) {
 
 	b.FileEventRate = poolDist(b.FileEventRate, fresh.FileEventRate)
 	b.WriteRate = poolDist(b.WriteRate, fresh.WriteRate)
+	b.CreateRate = poolDist(b.CreateRate, fresh.CreateRate)
 	b.RenameRate = poolDist(b.RenameRate, fresh.RenameRate)
 	b.DeleteRate = poolDist(b.DeleteRate, fresh.DeleteRate)
 	b.DirFanout = poolDist(b.DirFanout, fresh.DirFanout)

@@ -240,17 +240,18 @@ type Signal struct {
 | 1 | `entropy_deviation` | Primary | `EntropyByExt[ext]` | Implemented |
 | 2 | `magic_mismatch` | Primary | none | Implemented |
 | 3 | `write_burst` | Primary | `WriteRateByProc[name]`, falling back to `WriteRate` | Implemented |
-| 4 | `rename_burst` | Primary | `RenameRate` | Implemented |
-| 5 | `unknown_extension_activity` | Primary | `KnownExt` | Implemented |
-| 6 | `delete_rate` | Secondary | `DeleteRate` | Implemented |
-| 7 | `dir_fanout` | Secondary | `DirFanout` | Implemented |
-| 8 | `cum_bytes_rewritten` | Secondary | none | Implemented |
-| 9 | `write_rate_absolute` | Primary | none — uncalibrated fallback only | Implemented |
-| 10 | `persistence_install` | Override | none | Implemented (rule `R-PERSIST-INSTALL`) |
-| 11 | `static_reputation` | Secondary | none | **Phase 7** — not yet emitted |
-| 12 | `decoy_touch` | Override | none | Implemented (rule `R-DECOY-TOUCH`) |
-| 13 | `bus_drops` | Secondary | none | Implemented |
-| 14 | `ngram_rename_chain` | Secondary | none — the window's own sequence | Implemented |
+| 4 | `create_burst` | Primary | `CreateRate` | Implemented |
+| 5 | `rename_burst` | Primary | `RenameRate` | Implemented |
+| 6 | `unknown_extension_activity` | Primary | `KnownExt` | Implemented |
+| 7 | `delete_rate` | Secondary | `DeleteRate` | Implemented |
+| 8 | `dir_fanout` | Secondary | `DirFanout` | Implemented |
+| 9 | `cum_bytes_rewritten` | Secondary | none | Implemented |
+| 10 | `write_rate_absolute` | Primary | none — uncalibrated fallback only | Implemented |
+| 11 | `persistence_install` | Override | none | Implemented (rule `R-PERSIST-INSTALL`) |
+| 12 | `static_reputation` | Secondary | none | **Phase 7** — not yet emitted |
+| 13 | `decoy_touch` | Override | none | Implemented (rule `R-DECOY-TOUCH`) |
+| 14 | `bus_drops` | Secondary | none | Implemented |
+| 15 | `ngram_rename_chain` | Secondary | none — the window's own sequence | Implemented |
 
 ### Normalization rules
 
@@ -268,15 +269,26 @@ type Signal struct {
   `cum_bytes_rewritten`, `bus_drops`, `ngram_rename_chain` — are available either way.
 - `write_rate_absolute` exists precisely because omitting deviation signals leaves
   uncalibrated mode thin. It is a fixed bulk-modification threshold
-  (`scoring.absolute_write_rate`, default 20 writes/s) and is superseded by
-  `write_burst` the moment a baseline exists.
+  (`scoring.absolute_write_rate`, default 20/s) counting **writes and creates**, because bulk
+  modification is what it thresholds and a create-only storm is bulk modification. It is
+  superseded by `write_burst` and `create_burst` the moment a baseline exists.
 - `Detail` strings must state the measured value and the comparison, never just a score.
 - **Rates compare like with like.** Each burst signal is measured against a baseline of the
-  same kind — writes against `WriteRate`, renames against `RenameRate` — and the baselines
-  count **file events only**. An earlier version kept one all-event rate; on a host with 404
-  processes that was dominated by process events (92.5/s measured), so a 65-file burst at
-  2.2 writes/s could never reach its threshold and `write_burst` was unreachable on a real
-  machine. A subset rate must never be compared against a superset baseline.
+  same kind — writes against `WriteRate`, creates against `CreateRate`, renames against
+  `RenameRate` — and each rate counts one event kind and only that kind. An earlier version
+  kept one all-event rate; on a host with 404 processes that was dominated by process events
+  (92.5/s measured), so a 65-file burst at 2.2 writes/s could never reach its threshold and
+  `write_burst` was unreachable on a real machine. A subset rate must never be compared
+  against a superset baseline, and the converse holds too: counting creates as writes made
+  the write denominator a superset of the write numerator, which halved the apparent
+  deviation of a create-heavy workload and made host and audit attribution disagree about
+  the same one. `CreateRate` is what `create_burst` reads; `WriteRate` counts writes alone.
+- **Creates are counted, so they are scored.** A process that only creates files — an
+  unpacker, a restore, a locker writing a note in every directory — writes nothing the write
+  counter records. `TreeVector.Creates` was populated and read by no signal, so a create-only
+  storm was invisible in both modes: measured, **12,026 create events in one second produced
+  no verdict at all**. `create_burst` closes that, and the uncalibrated fallback counts
+  creates because with no baseline there is no create rate to compare against.
 - **A measured zero rate is not an absent one.** A warm-up on a quiet host records
   `rename_rate = 0` and `delete_rate = 0`, which is a measurement: the host never performed
   the action. Comparing a burst against that zero disables the signal — division by zero if
@@ -475,10 +487,12 @@ func (b *Baseline) Ready() bool
   (`N >= calibration.min_samples`). Before that, GRIMA runs in uncalibrated mode.
 - `StdDev` of `0` is replaced with a floor (`calibration.entropy_sigma_floor`, default
   `0.05`) to avoid division by zero on extensions that are always identical.
-- Persisted as JSON at `calibration.baseline_path`. **Schema version 2.** A version
-  mismatch is ignored rather than fatal, so a v1 baseline captured before the per-kind
-  rates existed puts the detector in uncalibrated mode and is re-captured by running
-  `--calibrate`.
+- Persisted as JSON at `calibration.baseline_path`. **Schema version 3.** A version
+  mismatch is ignored rather than fatal, so a v2 baseline captured before `create_rate`
+  existed puts the detector in uncalibrated mode and is re-captured by running
+  `--calibrate`. The bump is required rather than cosmetic: v2 counted creates as writes in
+  `WriteRate`, so an old file's write distribution is a superset of what `write_burst` now
+  measures against it.
 - `Recalibrate` observes a fresh window, merges it into an existing baseline with
   `Merge`, and returns the result. Reachable from the command line as `--recalibrate`;
   the detector exits after saving. This is the feedback edge in the architecture diagram.

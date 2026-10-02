@@ -134,6 +134,16 @@ weight = 1.0
 [[scoring.weights]]
 name = "write_burst"
 weight = 1.0
+# Creates per second against the host's measured create rate. A process that only
+# creates files — an unpacker, a restore, a locker writing a note per directory —
+# writes nothing the write counter records, so without this signal a create-only
+# storm is invisible. Weighted below write_burst because a create-only burst is
+# the weakest of the burst shapes: at 0.6 a saturated burst reaches the medium
+# band alone, and the host's own create rate is what keeps a machine that
+# unpacks all day quiet.
+[[scoring.weights]]
+name = "create_burst"
+weight = 0.6
 [[scoring.weights]]
 name = "write_rate_absolute"
 weight = 1.0

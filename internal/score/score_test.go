@@ -22,6 +22,7 @@ func testBaseline() *calibrate.Baseline {
 		},
 		WriteRateByProc: map[string]float64{},
 		WriteRate:       calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
+		CreateRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		RenameRate:      calibrate.Dist{Mean: 2, StdDev: 1, N: 100},
 		DeleteRate:      calibrate.Dist{Mean: 2, StdDev: 1, N: 100},
 		FileEventRate:   calibrate.Dist{Mean: 12, StdDev: 2, N: 100},

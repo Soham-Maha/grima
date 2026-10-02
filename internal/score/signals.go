@@ -40,6 +40,9 @@ func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
 		if sg, ok := writeBurstSignal(tv, b, windowSeconds, s.trustPerProcessBaseline(), minBurst); ok {
 			out = append(out, sg)
 		}
+		if sg, ok := createBurstSignal(tv, b, windowSeconds, minBurst); ok {
+			out = append(out, sg)
+		}
 		if sg, ok := renameBurstSignal(tv, b, windowSeconds, minBurst); ok {
 			out = append(out, sg)
 		}
@@ -90,11 +93,17 @@ func dropNoise(signals []Signal) []Signal {
 	return kept
 }
 
+// absoluteWriteRateSignal is the uncalibrated fallback. It counts creates as
+// well as writes, because bulk modification is the thing being thresholded and
+// a create-only storm is bulk modification: a mass copy, an unpacker, or a
+// locker writing a note per directory writes nothing the write counter sees.
+// With no baseline there is no create rate to compare against, so counting both
+// is the only way this fallback can see it at all.
 func absoluteWriteRateSignal(tv fingerprint.TreeVector, windowSeconds, base float64) (Signal, bool) {
 	if base <= 0 {
 		base = 20
 	}
-	rate := float64(tv.Writes) / windowSeconds
+	rate := float64(tv.Writes+tv.Creates) / windowSeconds
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -104,7 +113,7 @@ func absoluteWriteRateSignal(tv fingerprint.TreeVector, windowSeconds, base floa
 		Name:   "write_rate_absolute",
 		Class:  ClassPrimary,
 		Value:  value,
-		Detail: fmt.Sprintf("%.1f writes/s exceeds the uncalibrated threshold of %.0f/s", rate, base),
+		Detail: fmt.Sprintf("%.1f file modifications/s (writes+creates) exceed the uncalibrated threshold of %.0f/s", rate, base),
 	}, true
 }
 
@@ -198,6 +207,31 @@ func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSe
 		Value: value,
 		Detail: fmt.Sprintf("%.1f writes/s vs baseline %.1f/s (%.1fx, σ=%.1f)",
 			rate, base, excess, sigma),
+	}, true
+}
+
+// createBurstSignal is the burst shape the write signal cannot see. A process
+// that only creates files — an unpacker, a restore, a locker dropping a note in
+// every directory — writes nothing the write counter records, so before this
+// signal a create-only storm scored nothing at all: 12,026 create events in one
+// second produced no verdict in uncalibrated mode and no calibrated signal
+// either. Creates are counted, so they have to be scored.
+func createBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.CreateRate, windowSeconds, minBurst)
+	if !ok {
+		return Signal{}, false
+	}
+	rate := float64(tv.Creates) / windowSeconds
+	excess := rate / base
+	value := clamp01((excess - 1) / 7)
+	if value <= 0 {
+		return Signal{}, false
+	}
+	return Signal{
+		Name:   "create_burst",
+		Class:  ClassPrimary,
+		Value:  value,
+		Detail: fmt.Sprintf("%.1f creates/s vs host baseline %.1f/s (%.1fx)", rate, base, excess),
 	}, true
 }
 
