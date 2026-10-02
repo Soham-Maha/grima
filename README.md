@@ -196,6 +196,52 @@ Python 3 and take Windows-style paths.
 
 ## Platform notes
 
+### PowerShell works for everything except the shell harnesses
+
+The detector is a native Windows binary and every Python harness runs natively, so
+PowerShell is a complete environment for running GRIMA. Only the five `.sh` scenario
+scripts need a POSIX shell, and you can call Git Bash from PowerShell rather than working
+inside it:
+
+```powershell
+cd C:\Users\you\Documents\grima
+
+make build                                      # or: $env:CGO_ENABLED="0"; go build -trimpath -o grima.exe ./cmd/grima
+Copy-Item configs\grima.example.toml grima.toml
+(Get-Content grima.toml) -replace '^monitor_paths = .*',
+    'monitor_paths = ["C:/Users/you/Documents/grima-demo"]' | Set-Content grima.toml
+
+.\grima.exe --config grima.toml --calibrate
+.\grima.exe --config grima.toml --duration 2m    # dashboard on http://127.0.0.1:8787
+
+curl.exe -s http://127.0.0.1:8787/healthz        # curl.exe, not the Invoke-WebRequest alias
+Invoke-RestMethod http://127.0.0.1:8787/api/verdicts | ConvertTo-Json -Depth 4
+
+make lint; make test; make race
+
+# The shell harnesses, driven from PowerShell:
+& 'C:\Program Files\Git\bin\bash.exe' testdata/scenarios/smoke.sh
+& 'C:\Program Files\Git\bin\bash.exe' testdata/scenarios/benign-corpus.sh -n 2
+
+# The Python harnesses run natively:
+python testdata/scenarios/encryptor.py --path C:\Users\you\Documents\grima-demo --rate burst
+python testdata/scenarios/ablate.py --rounds 1
+```
+
+Four PowerShell-specific traps:
+
+| Trap | What to do |
+|---|---|
+| `bash` resolves to the WSL launcher, which cannot see `C:\` paths | call Git Bash by full path: `& 'C:\Program Files\Git\bin\bash.exe' <script>` |
+| `curl` is an alias for `Invoke-WebRequest`, with different arguments | use `curl.exe` |
+| `python3` is a Microsoft Store stub that succeeds and then does nothing | use `python` |
+| Environment variables are `$env:NAME="value"`, not `NAME=value cmd` | `$env:CGO_ENABLED="0"; go build …` |
+
+`make` is used throughout these docs; if it is not installed, every target has a direct
+equivalent (`go build`, `go test`, `go vet`, `gofmt -l .`).
+
+### Everything else
+
 - **Windows: use Git Bash for the shell scripts.** A `bash` that resolves to the WSL
   launcher cannot see `C:/` paths, and its `/tmp` is not a directory the detector can watch.
   The harnesses fail fast when their work root is not drive-lettered rather than reporting
