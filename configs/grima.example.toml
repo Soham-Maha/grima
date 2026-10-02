@@ -224,9 +224,15 @@ alert_min_level = "medium"
 
 # Throttle repeat alerts for one incident. An incident is identified by the
 # verdict's tree root — the process, or the host — and is cleared when severity
-# drops below alert_min_level or when the cooldown elapses. "0s" (the default)
-# disables throttling, so every scoring tick over the band logs an alert.
-alert_cooldown = "0s"
+# drops below alert_min_level or when the cooldown elapses.
+#
+# One minute here rather than the binary's own "0s" default, which disables
+# throttling: the score loop emits a verdict every second, so an incident that
+# lasts five minutes writes three hundred identical alert lines and buries
+# everything else in the log. Throttling gates the alert log only — the verdict
+# stream, the history and the dashboard are unaffected — so a shorter cooldown
+# costs nothing but noise. Set "0s" to log every tick.
+alert_cooldown = "1m"
 
 [web]
 enabled = true

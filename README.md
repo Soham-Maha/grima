@@ -301,7 +301,7 @@ documents every option. The settings that matter most:
 | `general.monitor_paths` | Directories to watch. Anything outside this set is invisible. |
 | `calibration.warmup` | How long to observe the host before deviation signals activate. |
 | `filewatch.startup_deadline` | How long startup may spend registering watches on a large tree; the rest are registered in the background and counted as `add_pending`. |
-| `response.alert_cooldown` | Hold repeat alerts for one incident. Off by default: a persistent condition logs on every scoring tick. |
+| `response.alert_cooldown` | Hold repeat alerts for one incident. The example ships `1m`; the binary's own default is `0s`, which logs an identical line on every scoring tick. |
 | `response.enable_suspend` | Off by default. Terminating processes on a heuristic score is a denial-of-service risk. |
 
 ## How it works

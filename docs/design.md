@@ -699,8 +699,11 @@ identified by the verdict's tree root — the process, or the host when no proce
 claimed — and `response.alert_cooldown` holds further alerts for that root until it
 elapses. An incident ends when a verdict below `alert_min_level` reaches the responder
 (its next rise then alerts immediately), or, if the root stops carrying evidence
-entirely, when the cooldown elapses. A zero cooldown disables throttling and is the
-default, so alert emission is unchanged unless opted into. Throttling gates only the
+entirely, when the cooldown elapses. A zero cooldown disables throttling and is the binary's
+default, so alert emission is unchanged unless opted into; the shipped example
+configuration sets `1m`, because a five-minute incident otherwise writes three hundred
+identical alert lines and buries everything else in the log. Throttling gates the alert log
+only — the verdict stream, the history and the dashboard are unaffected. Throttling gates only the
 alert log; the verdict stream and the dashboard are unaffected.
 
 ---

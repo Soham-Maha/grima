@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -549,5 +550,46 @@ func TestBusDropsSignalCoversOnlyTheWindowThatDropped(t *testing.T) {
 	loop.evaluate()
 	if anyVerdictHasSignal(hub.Latest(), "bus_drops") {
 		t.Fatalf("bus_drops survived into a window that dropped nothing: %v", hub.Latest())
+	}
+}
+
+// Run wires the whole pipeline: platform detection, sensors, bus, the engine
+// loop, scoring, response and the dashboard. Nothing else exercises that wiring,
+// which is how a data race between the engine's writer and its readers survived a
+// green make race — every other test builds the pieces and calls them directly.
+func TestRunWiresThePipelineEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Decoy.Enabled = false
+	cfg.Web.Enabled = false
+	cfg.Bus.Capacity = 64
+	cfg.Calibration.BaselinePath = filepath.Join(t.TempDir(), "baseline.json")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, Options{Duration: 3 * time.Second}, slog.New(slog.DiscardHandler))
+	}()
+
+	// Activity for the real sensors to observe on this host.
+	for i := range 25 {
+		path := filepath.Join(dir, fmt.Sprintf("doc%d.txt", i))
+		if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	err := <-done
+	if err != nil {
+		// A host with no usable user-space notification API cannot run the
+		// detector at all; that is the contract Run enforces, and it is not a
+		// failure of the wiring this test is about.
+		if strings.Contains(err.Error(), "no sensor could start") {
+			t.Skipf("this host exposes no usable sensor: %v", err)
+		}
+		t.Fatalf("Run: %v", err)
 	}
 }

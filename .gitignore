@@ -52,6 +52,11 @@ grima-decoys.json
 # Run output
 *.log
 
+# Evaluation harness output: the scenario scripts write their measurements here,
+# and the tuned weight table is generated rather than authored.
+/results/
+/configs/*.tuned.toml
+
 # Smoke test scratch
 /.smoke/
 
