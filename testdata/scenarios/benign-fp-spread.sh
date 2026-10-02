@@ -21,7 +21,7 @@
 #   GRIMA_FP_SPREAD_ROUNDS  rounds to run (default 5)
 #   GRIMA_FP_SPREAD_WORK    work root (default $TMPDIR/grima-fp-spread)
 #   plus everything benign-fp-check.sh honours: GRIMA_BINARY, GRIMA_FP_PORT,
-#   GRIMA_FP_DURATION, GRIMA_FP_PYTHON
+#   GRIMA_FP_DURATION, GRIMA_FP_WARMUP, GRIMA_FP_PYTHON
 #
 # Exits 0 when every round stayed silent, 1 when any round alerted, 2 when a
 # round could not complete.

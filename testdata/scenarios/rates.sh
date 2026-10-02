@@ -9,17 +9,15 @@
 #                 the only track that can fire. This is the crisp dual-track
 #                 demonstration: every decaying-window signal absent, the
 #                 cumulative counters climbing until they cross the band.
-#                 Each file's write is spread over 2500 ms (the remaining 2.5 s
-#                 is the pacing sleep) because correlation attribution only
-#                 considers processes seen writing in the last 2 s
-#                 (4 x attribution.max_delay). A single-shot write finishes
-#                 before any process sample lands on it, so the rename that
-#                 carries the new extension gets blamed on whichever process was
-#                 busy instead: GRIMA_RATES_QUIET_WRITE_MS=0 reproduces that, and
-#                 the same 24 writes then split across four fingerprints
-#                 (0.18 + 0.16 + 0.08 + 0.06), no fingerprint crosses the band,
-#                 and the run produces no alert even though every window signal
-#                 is absent and the evidence is complete.
+#                 GRIMA_RATES_QUIET_WRITE_MS (default 2500) spreads each file's
+#                 write over that many milliseconds. The default was chosen when
+#                 the detector defaulted to correlation attribution, which only
+#                 considered processes seen writing in the last 2 s, so a
+#                 single-shot write was blamed on whichever process happened to
+#                 be busy and the evidence fragmented across four fingerprints
+#                 (0.18 + 0.16 + 0.08 + 0.06) with no fingerprint crossing the
+#                 band. Under the host-filing default that mechanism is gone and
+#                 the default's effect is not re-measured — see §23.
 #   intermittent  `encryptor.py --rate intermittent`, which overwrites only the
 #                 first 4 KiB of each file.
 #   tail          a file whose head is untouched and whose last 4 KiB is
@@ -71,12 +69,15 @@ BINARY="${GRIMA_BINARY:-$ROOT_SH/grima}"
 [ -x "$BINARY" ] || { echo "error: build grima first (make build), or set GRIMA_BINARY" >&2; exit 2; }
 
 # A `python3` on PATH may be a Windows Store stub that prints an install message
-# and does nothing, so each candidate has to prove it runs.
+# and exits 0, so `-c 'import sys'` proves nothing: the stub satisfies it and
+# then fails to open any script. Each candidate has to prove it evaluates code
+# and prints the answer, which the stub does not.
 pick_python() {
-  local candidate
+  local candidate got
   for candidate in "$@"; do
     [ -n "$candidate" ] || continue
-    if "$candidate" -c 'import sys' >/dev/null 2>&1; then
+    got="$("$candidate" -c 'print(4**2)' 2>/dev/null | tr -d '\r')"
+    if [ "$got" = "16" ]; then
       printf '%s' "$candidate"
       return 0
     fi
@@ -89,6 +90,24 @@ PYTHON="$(pick_python "${GRIMA_RATES_PYTHON:-}" python3 python)" \
 
 PORT="${GRIMA_RATES_PORT:-8794}"
 WORK="${GRIMA_RATES_WORK:-${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/grima-rates}"
+
+# A work root the detector cannot address produces an empty baseline and a
+# sensor reporting "no directory could be watched", which reads like a detector
+# failure rather than a misconfigured path. Under Git-Bash, /tmp has been seen
+# to resolve to a WSL share (//wsl.localhost/...), which filewatch cannot open.
+# Fail before anything is measured rather than after the phase reports nothing.
+# Git-Bash converts through cygpath and WSL through wslpath; both are checked,
+# because the WSL route yields a //wsl.localhost path the detector cannot open.
+if command -v cygpath >/dev/null 2>&1 || command -v wslpath >/dev/null 2>&1; then
+  case "$(to_host_path "$WORK")" in
+    [A-Za-z]:*) ;;
+    *)
+      echo "error: work root $WORK is not a drive-letter path the detector can watch" >&2
+      echo "       set GRIMA_RATES_WORK=\"\$TEMP/grima-rates\" (or fix TMPDIR)" >&2
+      exit 2
+      ;;
+  esac
+fi
 FILES="${GRIMA_RATES_FILES:-20}"
 QUIET_FILES="${GRIMA_RATES_QUIET_FILES:-24}"
 QUIET_WRITE_MS="${GRIMA_RATES_QUIET_WRITE_MS:-2500}"
@@ -137,6 +156,12 @@ baseline_path = "$(to_host_path "$dir/baseline.json")"
 
 [procwatch]
 sample_interval = "500ms"
+
+[attribution]
+# Pinned rather than defaulted. Every check in this script describes how the
+# detector behaves when evidence is filed at the host, so a change to the
+# default must not silently re-point the measurements underneath it.
+mode = "host"
 EOF
 }
 
