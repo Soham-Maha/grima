@@ -173,16 +173,36 @@ Source: https://cs.opensource.google/go/x/sys
 ### SigmaHQ rule corpus
 
 **Used for:** the detection logic behind the hard rules `R-SHADOW-DELETE`,
-`R-EVENTLOG-CLEAR`, `R-USN-DELETE`, and `R-BACKUP-KILL`, which encode known
-pre-encryption and anti-recovery command patterns (`vssadmin delete shadows`,
-`wevtutil cl`, `fsutil usn deletejournal`, backup-service termination).
+`R-EVENTLOG-CLEAR`, `R-USN-DELETE`, `R-BACKUP-KILL`, `R-FIREWALL-OFF`,
+`R-SERVICE-TAMPER`, and `R-EDR-KILL`, which encode known pre-encryption,
+anti-recovery, and detection-evasion command patterns. The specific Sigma rules
+consulted, with their identifiers and authors, are:
+
+| Sigma rule | ID | Author(s) |
+|---|---|---|
+| Shadow Copies Deletion Using Operating Systems Utilities | `c947b146-0abc-4c87-9c64-b17e9d7274a2` | Florian Roth (Nextron Systems), Michael Haag, Teymur Kheirkhabarov, Daniil Yugoslavskiy, oscd.community, Andreas Hunkeler (@Karneades) |
+| Boot Configuration Tampering Via Bcdedit.EXE | `1444443e-6757-43e4-9ea4-c8fc705f79a2` | E.M. Anhaus (Atomic Blue Detections, Endgame), oscd.community |
+| Suspicious Eventlog Clearing or Configuration Change Activity | `cc36992a-4671-4f21-a91d-6c2b72a2edf5` | Ecco, Daniil Yugoslavskiy, oscd.community, D3F7A5105, Swachchhanda Shrawan Poudel (Nextron Systems) |
+| Firewall Disabled via Netsh.EXE | `57c4bf16-227f-4394-8ec7-1b745ee061c3` | Fatih Sirin |
+| Suspicious Windows Service Tampering | `ce72ef99-22f1-43d4-8695-419dcb5d9330` | Nasreddine Bencherchali (Nextron Systems), frack113, X__Junior (Nextron Systems) |
+| Taskkill Symantec Endpoint Protection | `4a6713f6-3331-11ed-a261-0242ac120002` | Ilya Krestinichev, Florian Roth (Nextron Systems) |
+
+The anti-recovery command patterns (`vssadmin delete shadows`, `wevtutil cl`,
+`fsutil usn deletejournal`, `wbadmin delete catalog`, `bcdedit` recovery and boot
+status tampering, backup-service termination) are derived from the same corpus.
 
 **License:** Detection Rule License (DRL) 1.1 — see
-https://github.com/SigmaHQ/sigma/blob/master/LICENSE.Detection.Rules.md
+https://github.com/SigmaHQ/Detection-Rule-License/blob/main/LICENSE.Detection.Rules.md
+and https://github.com/SigmaHQ/sigma/blob/master/LICENSE.Detection.Rules.md
+
+**Copyright:** the source rules are copyright their individual authors, listed in
+the table above; attribution is retained per the DRL 1.1 condition.
 
 The rules in GRIMA are **independent reimplementations as Go predicates**, not
 verbatim copies of Sigma YAML. The command patterns and severity rationale are derived
-from the corpus.
+from the corpus. One deliberate narrowing: Sigma flags `vssadmin resize shadowstorage`
+whenever a `/MaxSize=` is given, whereas GRIMA matches only the destructive zero case
+(`maxsize=0`) so routine storage resizing does not trip a hard override.
 
 Source: https://github.com/SigmaHQ/sigma
 
