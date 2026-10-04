@@ -52,7 +52,16 @@ func (r *Registry) Count() int {
 	return len(r.byPath)
 }
 
-// Plant writes canary files into the monitored directories and registers them.
+// Plant writes canary files into the monitored directories, registers them, and
+// records their paths in the manifest so they can be taken out again.
+//
+// Depth is bounded by decoy.max_depth and defaults to zero: decoys go in the
+// monitored roots and nowhere else. Recursing writes count_per_dir files into
+// every directory of the tree, which on a real home directory is thousands of
+// plausible-looking documents left in the user's folders, their version control
+// and their backups — measured at 66 files across 33 directories from a
+// three-second run over a small tree. An operator who wants that reach asks for
+// it.
 //
 // Directories that cannot be written are skipped rather than failing the run:
 // planting decoys in some directories is still useful, and an unreadable system
@@ -62,9 +71,10 @@ func Plant(cfg config.Config, reg *Registry) (int, error) {
 		return 0, nil
 	}
 
-	const maxDepth = 3
+	maxDepth := cfg.Decoy.MaxDepth
 
 	planted := 0
+	var paths []string
 	var firstErr error
 
 	var walk func(dir string, depth int)
@@ -80,7 +90,9 @@ func Plant(cfg config.Config, reg *Registry) (int, error) {
 			return
 		}
 
-		planted += plantIn(dir, cfg.Decoy, reg)
+		found := plantIn(dir, cfg.Decoy, reg)
+		planted += len(found)
+		paths = append(paths, found...)
 
 		for _, it := range items {
 			if !it.IsDir() {
@@ -98,11 +110,17 @@ func Plant(cfg config.Config, reg *Registry) (int, error) {
 		walk(root, 0)
 	}
 
+	if err := recordPlanted(cfg.Decoy.ManifestPath, paths); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
 	return planted, firstErr
 }
 
-func plantIn(dir string, dc config.DecoyConfig, reg *Registry) int {
-	planted := 0
+// plantIn writes this directory's decoys and returns the paths that are decoys
+// afterwards, whether this run wrote them or an earlier one did.
+func plantIn(dir string, dc config.DecoyConfig, reg *Registry) []string {
+	var planted []string
 	for i, name := range dc.Names {
 		if i >= dc.CountPerDir {
 			break
@@ -111,14 +129,14 @@ func plantIn(dir string, dc config.DecoyConfig, reg *Registry) int {
 
 		if _, err := os.Stat(path); err == nil {
 			reg.Add(path, decoyID(path)) // already there from a previous run
-			planted++
+			planted = append(planted, path)
 			continue
 		}
 		if err := os.WriteFile(path, []byte(decoyBody), 0o644); err != nil {
 			continue
 		}
 		reg.Add(path, decoyID(path))
-		planted++
+		planted = append(planted, path)
 	}
 	return planted
 }

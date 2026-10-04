@@ -27,6 +27,7 @@ func run() error {
 	duration := flag.Duration("duration", 0, "stop after this long (0 means run until interrupted)")
 	calibrate := flag.Bool("calibrate", false, "capture a host baseline and exit")
 	recalibrate := flag.Bool("recalibrate", false, "fold a fresh window into the existing baseline and exit")
+	removeDecoys := flag.Bool("remove-decoys", false, "delete the canary files recorded in the decoy manifest and exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -43,6 +44,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	options := app.Options{Duration: *duration, Calibrate: *calibrate, Recalibrate: *recalibrate}
+	options := app.Options{
+		Duration:     *duration,
+		Calibrate:    *calibrate,
+		Recalibrate:  *recalibrate,
+		RemoveDecoys: *removeDecoys,
+	}
 	return app.Run(ctx, cfg, options, newLogger(cfg.General.LogLevel))
 }

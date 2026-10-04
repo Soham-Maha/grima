@@ -20,6 +20,16 @@ const (
 	minRenameChains = 4
 )
 
+// The chain share saturates at the density a real encryptor produces. fsnotify
+// reports an encryptor's loop as create, write, rename, create — the rename's
+// destination arrives as its own create event — so one adjacent transition in
+// four is a write followed by a rename, and a tenth of that is ordinary file
+// management rather than a pattern.
+const (
+	chainShareFloor     = 0.1
+	chainShareSaturates = 1.0 / 3.0
+)
+
 // computeSignals derives every available signal. Signals whose baseline input is
 // missing are omitted rather than zeroed: zero means "benign", not "unknown".
 func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
@@ -31,24 +41,28 @@ func (s *Scorer) computeSignals(in Inputs, calibrated bool) []Signal {
 	if windowSeconds <= 0 {
 		windowSeconds = 1
 	}
+	minBurst := s.cfg.Scoring.ZeroBaselineBurst
 
 	if calibrated {
 		if sg, ok := entropySignal(tv, b); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := writeBurstSignal(tv, b, windowSeconds, s.trustPerProcessBaseline()); ok {
+		if sg, ok := writeBurstSignal(tv, b, windowSeconds, s.trustPerProcessBaseline(), minBurst); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := renameBurstSignal(tv, b, windowSeconds); ok {
+		if sg, ok := createBurstSignal(tv, b, windowSeconds, minBurst); ok {
+			out = append(out, sg)
+		}
+		if sg, ok := renameBurstSignal(tv, b, windowSeconds, minBurst); ok {
 			out = append(out, sg)
 		}
 		if sg, ok := unknownExtensionSignal(tv, b); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := deleteRateSignal(tv, b, windowSeconds); ok {
+		if sg, ok := deleteRateSignal(tv, b, windowSeconds, minBurst); ok {
 			out = append(out, sg)
 		}
-		if sg, ok := dirFanoutSignal(tv, b); ok {
+		if sg, ok := dirFanoutSignal(tv, b, minBurst); ok {
 			out = append(out, sg)
 		}
 	}
@@ -89,11 +103,17 @@ func dropNoise(signals []Signal) []Signal {
 	return kept
 }
 
+// absoluteWriteRateSignal is the uncalibrated fallback. It counts creates as
+// well as writes, because bulk modification is the thing being thresholded and
+// a create-only storm is bulk modification: a mass copy, an unpacker, or a
+// locker writing a note per directory writes nothing the write counter sees.
+// With no baseline there is no create rate to compare against, so counting both
+// is the only way this fallback can see it at all.
 func absoluteWriteRateSignal(tv fingerprint.TreeVector, windowSeconds, base float64) (Signal, bool) {
 	if base <= 0 {
 		base = 20
 	}
-	rate := float64(tv.Writes) / windowSeconds
+	rate := float64(tv.Writes+tv.Creates) / windowSeconds
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -103,7 +123,7 @@ func absoluteWriteRateSignal(tv fingerprint.TreeVector, windowSeconds, base floa
 		Name:   "write_rate_absolute",
 		Class:  ClassPrimary,
 		Value:  value,
-		Detail: fmt.Sprintf("%.1f writes/s exceeds the uncalibrated threshold of %.0f/s", rate, base),
+		Detail: fmt.Sprintf("%.1f file modifications/s (writes+creates) exceed the uncalibrated threshold of %.0f/s", rate, base),
 	}, true
 }
 
@@ -165,9 +185,9 @@ func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
 	if ng.Total < minNGramWindows || ng.RenameChains < minRenameChains {
 		return Signal{}, false
 	}
-	// A quarter of the window being chains is ordinary file management; eight in
-	// ten saturates.
-	value := clamp01((ng.ChainShare - 0.25) / 0.55)
+	// A tenth of the transitions being chains is ordinary file management; the
+	// density a real encryptor cycle produces saturates.
+	value := clamp01((ng.ChainShare - chainShareFloor) / (chainShareSaturates - chainShareFloor))
 	if value <= 0 {
 		return Signal{}, false
 	}
@@ -175,14 +195,14 @@ func ngramRenameChainSignal(tv fingerprint.TreeVector) (Signal, bool) {
 		Name:  "ngram_rename_chain",
 		Class: ClassSecondary,
 		Value: value,
-		Detail: fmt.Sprintf("%d of %d %d-grams hold a write>rename chain; dominant %s x%d",
-			ng.RenameChains, ng.Total, ng.K, ng.Sequence, ng.Count),
+		Detail: fmt.Sprintf("%d of %d adjacent transitions are write>rename (%.0f%%); dominant %d-gram %s x%d",
+			ng.RenameChains, ng.Pairs, ng.ChainShare*100, ng.K, ng.Sequence, ng.Count),
 	}, true
 }
 
-func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64, trustPerProcess bool) (Signal, bool) {
+func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64, trustPerProcess bool, minBurst float64) (Signal, bool) {
 	rate := float64(tv.Writes) / windowSeconds
-	base, sigma, ok := rateBaseline(b, tv.ProcName, trustPerProcess)
+	base, sigma, ok := rateBaseline(b, tv.ProcName, trustPerProcess, windowSeconds, minBurst)
 	if !ok || base <= 0 {
 		return Signal{}, false
 	}
@@ -200,12 +220,37 @@ func writeBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSe
 	}, true
 }
 
-func renameBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64) (Signal, bool) {
-	if b.RenameRate.Mean <= 0 {
+// createBurstSignal is the burst shape the write signal cannot see. A process
+// that only creates files — an unpacker, a restore, a locker dropping a note in
+// every directory — writes nothing the write counter records, so before this
+// signal a create-only storm scored nothing at all: 12,026 create events in one
+// second produced no verdict in uncalibrated mode and no calibrated signal
+// either. Creates are counted, so they have to be scored.
+func createBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.CreateRate, windowSeconds, minBurst)
+	if !ok {
+		return Signal{}, false
+	}
+	rate := float64(tv.Creates) / windowSeconds
+	excess := rate / base
+	value := clamp01((excess - 1) / 7)
+	if value <= 0 {
+		return Signal{}, false
+	}
+	return Signal{
+		Name:   "create_burst",
+		Class:  ClassPrimary,
+		Value:  value,
+		Detail: fmt.Sprintf("%.1f creates/s vs host baseline %.1f/s (%.1fx)", rate, base, excess),
+	}, true
+}
+
+func renameBurstSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.RenameRate, windowSeconds, minBurst)
+	if !ok {
 		return Signal{}, false
 	}
 	rate := float64(tv.Renames) / windowSeconds
-	base := b.RenameRate.Mean
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -260,12 +305,12 @@ func unknownExtensionSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (S
 	}, true
 }
 
-func deleteRateSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds float64) (Signal, bool) {
-	if b.DeleteRate.Mean <= 0 {
+func deleteRateSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSeconds, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.DeleteRate, windowSeconds, minBurst)
+	if !ok {
 		return Signal{}, false
 	}
 	rate := float64(tv.Deletes) / windowSeconds
-	base := b.DeleteRate.Mean
 	excess := rate / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
@@ -279,12 +324,16 @@ func deleteRateSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, windowSe
 	}, true
 }
 
-func dirFanoutSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (Signal, bool) {
-	if b.DirFanout.Mean <= 0 {
+// dirFanoutSignal compares the tree's distinct directory count against the
+// host's pooled per-process distribution. The units are directories, not a rate,
+// so the zero-baseline floor is a directory count rather than a rate.
+func dirFanoutSignal(tv fingerprint.TreeVector, b *calibrate.Baseline, minBurst float64) (Signal, bool) {
+	base, ok := deviationBase(b.DirFanout, 1, minBurst)
+	if !ok {
 		return Signal{}, false
 	}
 	dirs := tv.DirCount()
-	excess := float64(dirs) / b.DirFanout.Mean
+	excess := float64(dirs) / base
 	value := clamp01((excess - 1) / 7)
 	if value <= 0 {
 		return Signal{}, false
@@ -293,7 +342,7 @@ func dirFanoutSignal(tv fingerprint.TreeVector, b *calibrate.Baseline) (Signal, 
 		Name:   "dir_fanout",
 		Class:  ClassSecondary,
 		Value:  value,
-		Detail: fmt.Sprintf("touched %d directories vs baseline %.1f", dirs, b.DirFanout.Mean),
+		Detail: fmt.Sprintf("touched %d directories vs baseline %.1f", dirs, base),
 	}, true
 }
 
@@ -316,7 +365,9 @@ func bytesRewrittenSignal(tv fingerprint.TreeVector) (Signal, bool) {
 }
 
 // busDropSignal treats overload as evidence: a storm that saturates the bus also
-// means the window under-counted.
+// means the window under-counted. The count is the drops during this window, not
+// the run: a lifetime total would keep marking every verdict long after the
+// overload passed.
 func busDropSignal(dropped uint64) (Signal, bool) {
 	if dropped == 0 {
 		return Signal{}, false
@@ -325,7 +376,7 @@ func busDropSignal(dropped uint64) (Signal, bool) {
 		Name:   "bus_drops",
 		Class:  ClassSecondary,
 		Value:  clamp01(float64(dropped) / 1000),
-		Detail: fmt.Sprintf("%d events dropped by the bus (window under-counts)", dropped),
+		Detail: fmt.Sprintf("%d events dropped by the bus in this window (window under-counts)", dropped),
 	}, true
 }
 
@@ -337,6 +388,33 @@ func (s *Scorer) trustPerProcessBaseline() bool {
 	return s.cfg.Attribution.Mode == config.AttributionAudit
 }
 
+// deviationBase returns the denominator a deviation signal is measured against.
+//
+// The second result is false when the baseline holds no samples for this
+// quantity at all: that is unknown, and an unknown signal is omitted rather
+// than reported as zero.
+//
+// A measured rate of zero is not unknown. It says the host never performed the
+// action during warm-up, so there is no multiple to express tolerance in — and
+// disabling the signal, which is what comparing against zero used to do, left
+// the one signal that could see a burst on a quiet host permanently dead while
+// health still reported the baseline as ready. Flooring the denominator at the
+// smallest burst that counts as evidence keeps the ratio finite and the signal
+// available, without letting a single ordinary event saturate it: scale is the
+// window in seconds for a rate, or 1 for a count.
+func deviationBase(d calibrate.Dist, scale, minBurst float64) (float64, bool) {
+	if d.N <= 0 || scale <= 0 {
+		return 0, false
+	}
+	if d.Mean > 0 {
+		return d.Mean, true
+	}
+	if minBurst <= 0 {
+		return 0, false
+	}
+	return minBurst / scale, true
+}
+
 // rateBaseline returns the rate a write burst is measured against.
 //
 // A per-process baseline is only meaningful when the blamed process really is
@@ -346,16 +424,17 @@ func (s *Scorer) trustPerProcessBaseline() bool {
 // workload was blamed on firefox.exe, whose 1.67 writes/s baseline made the
 // burst look 5-10x over and produced a medium false positive, where the host
 // baseline of 130.3 writes/s would not have fired at all.
-func rateBaseline(b *calibrate.Baseline, procName string, trustPerProcess bool) (base, sigma float64, ok bool) {
+func rateBaseline(b *calibrate.Baseline, procName string, trustPerProcess bool, windowSeconds, minBurst float64) (base, sigma float64, ok bool) {
 	if trustPerProcess && procName != "" {
 		if v, found := b.WriteRateByProc[procName]; found && v > 0 {
 			return v, b.WriteRate.StdDev, true
 		}
 	}
-	if b.WriteRate.Mean > 0 {
-		return b.WriteRate.Mean, b.WriteRate.StdDev, true
+	base, ok = deviationBase(b.WriteRate, windowSeconds, minBurst)
+	if !ok {
+		return 0, 0, false
 	}
-	return 0, 0, false
+	return base, b.WriteRate.StdDev, true
 }
 
 func topUnknownExts(m map[string]int64, b *calibrate.Baseline, n int) string {

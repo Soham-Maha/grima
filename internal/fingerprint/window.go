@@ -208,20 +208,42 @@ type NGram struct {
 	Total        int     // k-grams observed in the window
 	Sequence     string  // the most frequent k-gram, reduced to its cycle when it repeats
 	Count        int     // occurrences of Sequence
-	RenameChains int     // k-grams containing a write followed by a rename
-	ChainShare   float64 // RenameChains / Total
+	Pairs        int     // adjacent event pairs in the window
+	RenameChains int     // adjacent pairs that are a write followed by a rename
+	ChainShare   float64 // RenameChains / Pairs
 }
 
 // ngramOf derives the feature from a window's kinds in chronological order.
 // k-grams are counted by rolling hash, so a busy window builds no string key per
 // k-gram. It returns the zero value when the window holds fewer than k events,
 // which is not the same as "no chains observed".
+//
+// The chain share is measured over adjacent pairs, not over k-grams. A k-gram
+// spans k-1 pairs, so counting k-grams that contain a chain made the share a
+// step function rather than a density: at the default k=32 a single
+// write-then-rename adjacency lies inside up to 31 overlapping k-grams, so one
+// ordinary rename in a short window read as a saturated pattern. Pairs are what
+// the claim "a quarter of the window is chains" is actually about.
 func ngramOf(kinds []event.Kind, k int) NGram {
 	out := NGram{K: k}
 	if k <= 0 || len(kinds) < k {
 		return out
 	}
 	out.Total = len(kinds) - k + 1
+
+	// A transition needs two events, so a 1-gram window has no transitions to
+	// measure and reports no chains rather than reporting every adjacency.
+	if k >= 2 {
+		out.Pairs = len(kinds) - 1
+		for i := 0; i+1 < len(kinds); i++ {
+			if isRenameChain(kinds[i], kinds[i+1]) {
+				out.RenameChains++
+			}
+		}
+		if out.Pairs > 0 {
+			out.ChainShare = float64(out.RenameChains) / float64(out.Pairs)
+		}
+	}
 
 	pow := uint64(1)
 	for range k {
@@ -231,7 +253,6 @@ func ngramOf(kinds []event.Kind, k int) NGram {
 	seen := make(map[uint64]int, out.Total)
 	var hash uint64
 	best, bestAt := 0, 0
-	chains := 0
 
 	for i, kind := range kinds {
 		hash = hash*kindHashBase + uint64(kind)
@@ -240,28 +261,6 @@ func ngramOf(kinds []event.Kind, k int) NGram {
 		}
 		if i < k-1 {
 			continue
-		}
-
-		// Slide the chain window: the k-gram at start gains the pair (i-1, i)
-		// and loses the pair (start-1, start).
-		start := i - k + 1
-		switch {
-		case start == 0:
-			for j := start; j < i; j++ {
-				if isRenameChain(kinds[j], kinds[j+1]) {
-					chains++
-				}
-			}
-		default:
-			if isRenameChain(kinds[i-1], kinds[i]) {
-				chains++
-			}
-			if isRenameChain(kinds[start-1], kinds[start]) {
-				chains--
-			}
-		}
-		if chains > 0 {
-			out.RenameChains++
 		}
 
 		n := seen[hash] + 1
@@ -273,7 +272,6 @@ func ngramOf(kinds []event.Kind, k int) NGram {
 
 	out.Count = best
 	out.Sequence = renderKinds(kinds[bestAt-k+1 : bestAt+1])
-	out.ChainShare = float64(out.RenameChains) / float64(out.Total)
 	return out
 }
 

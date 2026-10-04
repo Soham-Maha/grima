@@ -150,9 +150,14 @@ func (s *Scorer) Evaluate(in Inputs) Verdict {
 	// day Phase 7 emits it. Gating on a Primary makes both impossible at any
 	// band value, so the tier's meaning no longer depends on where the band is
 	// set.
+	// A Primary opens the gate only if it actually contributes. A muted signal —
+	// no weight entry, or a weight of zero — is not evidence, so letting it gate
+	// would reinstate exactly the Secondary-only fusion the gate exists to
+	// prevent: with every Secondary saturated and a Primary at weight zero, the
+	// tier fused to 86.2 high, the number this gate was added to make impossible.
 	hasPrimary := false
 	for _, sg := range signals {
-		if sg.Class == ClassPrimary {
+		if sg.Class == ClassPrimary && s.cfg.WeightFor(sg.Name) > 0 {
 			hasPrimary = true
 			break
 		}
@@ -176,17 +181,25 @@ func (s *Scorer) Evaluate(in Inputs) Verdict {
 	v.Score = (1 - combined) * 100
 	v.Level = s.levelFor(v.Score)
 
-	// Overrides set a floor and are never averaged away by benign signals.
-	for _, sg := range signals {
+	// Overrides set a floor and are never averaged away by benign signals. The
+	// override reported is the one that set the floor, so a critical verdict
+	// names the rule that made it critical rather than whichever rule happened
+	// to be recorded first: a medium rule at t=0 and the decoy rule at t=5s
+	// otherwise produced Level=critical with Override=<the medium rule>.
+	raised := -1
+	for i, sg := range signals {
 		if sg.Class != ClassOverride {
 			continue
 		}
 		if sg.Level > v.Level {
 			v.Level = sg.Level
 		}
-		if v.Override == "" {
-			v.Override = sg.Name
+		if raised < 0 || sg.Level > signals[raised].Level {
+			raised = i
 		}
+	}
+	if raised >= 0 {
+		v.Override = signals[raised].Name
 	}
 
 	sort.SliceStable(signals, func(i, j int) bool {

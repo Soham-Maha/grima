@@ -5,14 +5,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/bus"
+	"github.com/prateekpurohit13/grima/internal/calibrate"
 	"github.com/prateekpurohit13/grima/internal/config"
+	"github.com/prateekpurohit13/grima/internal/decoy"
 	"github.com/prateekpurohit13/grima/internal/event"
 	"github.com/prateekpurohit13/grima/internal/fingerprint"
 	"github.com/prateekpurohit13/grima/internal/platform"
@@ -70,7 +76,9 @@ type healthPayload struct {
 func parseHealth(t *testing.T, events *bus.Bus, sources []sensor.Source) healthPayload {
 	t.Helper()
 
-	snapshot := healthSnapshot(time.Now(), events, sources, fingerprint.NewEngine(config.Default()), nil)
+	// The liveness count is published by the engine loop, which these tests do
+	// not run; they exercise the health encoding, so it is zero here.
+	snapshot := healthSnapshot(time.Now(), events, sources, 0, nil)
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatalf("marshal health: %v", err)
@@ -284,8 +292,304 @@ func TestWriteStormSurfacesDropsInHealthAndVerdicts(t *testing.T) {
 		t.Fatalf("no verdict carried the drop count (%d dropped); verdicts: %v", dropped, hub.Latest())
 	}
 
-	health := healthSnapshot(time.Now(), events, nil, engine, nil)
+	health := healthSnapshot(time.Now(), events, nil, engine.Live(), nil)
 	if health.BusDropped != dropped {
 		t.Errorf("health bus_dropped = %d, want %d", health.BusDropped, dropped)
+	}
+}
+
+// newTestEngineLoop builds the real loop over a real bus and hub, ticking fast
+// enough to observe without a second of wall clock.
+func newTestEngineLoop(t *testing.T, cfg config.Config, events *bus.Bus, hub *web.Hub, live *atomic.Int64) engineLoop {
+	t.Helper()
+
+	return engineLoop{
+		scoreLoop: scoreLoop{
+			cfg:       cfg,
+			events:    events,
+			engine:    fingerprint.NewEngine(cfg),
+			scorer:    score.NewScorer(cfg),
+			overrides: newOverrideTracker(cfg.Window.DecayHalfLife.Std()),
+			responder: response.NewHandler(cfg, slog.New(slog.DiscardHandler)),
+			hub:       hub,
+			log:       slog.New(slog.DiscardHandler),
+		},
+		in:       events.Subscribe("fingerprint", cfg.Bus.Capacity/2),
+		live:     live,
+		interval: time.Millisecond,
+	}
+}
+
+// The engine is owned by one goroutine, and the scoring pass runs there too, so
+// an event written by the ingest path is read by the scorer without a lock.
+// Health is asked for the same state from another goroutine, and it must get a
+// published value rather than reaching into the engine: if it ever reads window
+// state directly again, this test fails under -race.
+func TestEngineLoopScoresWhileHealthIsReadConcurrently(t *testing.T) {
+	cfg := config.Default()
+	cfg.Scoring.AbsoluteWriteRate = 1
+
+	events := bus.New(cfg.Bus.Capacity, bus.DropOldest)
+	defer events.Close()
+
+	var live atomic.Int64
+	// health is exactly the callback the hub hands to the /healthz handler, so
+	// calling it from another goroutine is the read path an operator triggers.
+	health := func() web.Health {
+		return healthSnapshot(time.Now(), events, nil, int(live.Load()), nil)
+	}
+	hub := web.NewHub(health)
+	loop := newTestEngineLoop(t, cfg, events, hub, &live)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		loop.run(ctx)
+	}()
+
+	// A sensor's worth of events, published while the loop is draining them.
+	go func() {
+		for range 400 {
+			events.Publish(event.Event{
+				Kind: event.KindFileWrite, Path: "/data/secret.docx", Time: time.Now(),
+				PID: 4242, ProcName: "encryptor", Bytes: 4096,
+			})
+		}
+	}()
+
+	// An HTTP handler's worth of health reads, concurrent with the loop.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if health().LiveProcesses > 0 && len(hub.Latest()) > 0 {
+			return // the loop published both a liveness count and a verdict
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("loop published no verdict or liveness count: live=%d verdicts=%d",
+		health().LiveProcesses, len(hub.Latest()))
+}
+
+// A loop stops on cancellation and on a closed input channel, so shutting the
+// detector down cannot leave it ticking against a dead bus.
+func TestEngineLoopStopsOnCancelAndOnClosedInput(t *testing.T) {
+	cases := []struct {
+		name  string
+		stop  func(cancel context.CancelFunc, in chan event.Event)
+		check func(t *testing.T)
+	}{
+		{
+			name: "cancelled context",
+			stop: func(cancel context.CancelFunc, in chan event.Event) { cancel() },
+		},
+		{
+			name: "closed input channel",
+			stop: func(cancel context.CancelFunc, in chan event.Event) { close(in) },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			events := bus.New(cfg.Bus.Capacity, bus.DropOldest)
+			defer events.Close()
+
+			var live atomic.Int64
+			hub := web.NewHub(func() web.Health { return web.Health{} })
+			loop := newTestEngineLoop(t, cfg, events, hub, &live)
+
+			in := make(chan event.Event, 1)
+			loop.in = in
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				loop.run(ctx)
+			}()
+
+			tc.stop(cancel, in)
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("loop did not stop")
+			}
+		})
+	}
+}
+
+// "Calibrated" is one gate over the whole baseline, so on its own it can read as
+// full coverage when a deviation signal has no distribution behind it. Health
+// publishes the sample count per distribution, and a zero there means the signal
+// is unavailable rather than that the host is quiet.
+func TestHealthPublishesBaselineSampleCounts(t *testing.T) {
+	baseline := &calibrate.Baseline{
+		CapturedAt:   time.Now(),
+		MinSamples:   1,
+		EntropyByExt: map[string]calibrate.Dist{".txt": {Mean: 5, StdDev: 1, N: 40}},
+		WriteRate:    calibrate.Dist{Mean: 3, StdDev: 1, N: 9},
+		RenameRate:   calibrate.Dist{Mean: 0, StdDev: 0, N: 7},
+	}
+
+	health := healthSnapshot(time.Now(), testBus(t), nil, 0, baseline)
+
+	if !health.CalibrationReady {
+		t.Fatal("baseline with enough entropy samples should be ready")
+	}
+	for name, want := range map[string]uint64{
+		"baseline_samples_entropy":     40,
+		"baseline_samples_write_rate":  9,
+		"baseline_samples_rename_rate": 7,
+		"baseline_samples_dir_fanout":  0,
+	} {
+		if got := health.Extra[name]; got != want {
+			t.Errorf("health %s = %d, want %d", name, got, want)
+		}
+	}
+}
+
+// Decoys are written into the user's own directories, so the run has to have an
+// undo that works from the manifest alone — after a restart, with nothing in
+// memory. This drives the real planting and the real removal.
+func TestRemoveDecoysUndoesAPreviousRun(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Decoy.Enabled = true
+	cfg.Decoy.ManifestPath = filepath.Join(t.TempDir(), "grima-decoys.json")
+
+	reg := decoy.NewRegistry()
+	planted, err := decoy.Plant(cfg, reg)
+	if err != nil {
+		t.Fatalf("Plant: %v", err)
+	}
+	if planted == 0 {
+		t.Fatal("nothing was planted; the test would measure nothing")
+	}
+
+	if err := runRemoveDecoys(cfg, slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("runRemoveDecoys: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("%d files survived removal", len(entries))
+	}
+	if _, err := os.Stat(cfg.Decoy.ManifestPath); !os.IsNotExist(err) {
+		t.Fatalf("manifest survived removal: %v", err)
+	}
+}
+
+func anyVerdictHasSignal(verdicts []score.Verdict, name string) bool {
+	for _, v := range verdicts {
+		for _, sg := range v.Signals {
+			if sg.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// The drop signal describes the window being scored, not the run. A lifetime
+// counter kept marking every verdict long after the overload had passed — and
+// because a verdict carrying any signal is published, it also filled the bounded
+// history ring with info-level noise and buried real findings.
+func TestBusDropsSignalCoversOnlyTheWindowThatDropped(t *testing.T) {
+	cfg := config.Default()
+	cfg.Bus.Capacity = 8
+	cfg.Scoring.AbsoluteWriteRate = 1
+	log := slog.New(slog.DiscardHandler)
+
+	events := bus.New(cfg.Bus.Capacity, bus.DropOldest)
+	defer events.Close()
+
+	// Nothing consumes this bus, so it fills and the rest is dropped.
+	for range 500 {
+		events.Publish(event.Event{Kind: event.KindFileWrite, Path: "/data/a.txt", Time: time.Now()})
+	}
+	if events.Stats().Dropped == 0 {
+		t.Fatal("the storm dropped nothing; the test measured nothing")
+	}
+
+	engine := fingerprint.NewEngine(cfg)
+	for range 200 {
+		engine.Apply(event.Event{
+			Kind: event.KindFileWrite, Path: "/data/a.txt", Time: time.Now(),
+			PID: 4242, ProcName: "cryptor",
+		})
+	}
+
+	hub := web.NewHub(func() web.Health { return web.Health{} })
+	loop := &scoreLoop{
+		cfg:       cfg,
+		events:    events,
+		engine:    engine,
+		scorer:    score.NewScorer(cfg),
+		overrides: newOverrideTracker(cfg.Window.DecayHalfLife.Std()),
+		responder: response.NewHandler(cfg, log),
+		hub:       hub,
+		log:       log,
+	}
+
+	loop.evaluate()
+	if !anyVerdictHasSignal(hub.Latest(), "bus_drops") {
+		t.Fatalf("the window that dropped events carried no bus_drops: %v", hub.Latest())
+	}
+
+	// The next window drops nothing, so nothing should still be reporting drops.
+	loop.evaluate()
+	if anyVerdictHasSignal(hub.Latest(), "bus_drops") {
+		t.Fatalf("bus_drops survived into a window that dropped nothing: %v", hub.Latest())
+	}
+}
+
+// Run wires the whole pipeline: platform detection, sensors, bus, the engine
+// loop, scoring, response and the dashboard. Nothing else exercises that wiring,
+// which is how a data race between the engine's writer and its readers survived a
+// green make race — every other test builds the pieces and calls them directly.
+func TestRunWiresThePipelineEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.General.MonitorPaths = []string{dir}
+	cfg.Decoy.Enabled = false
+	cfg.Web.Enabled = false
+	cfg.Bus.Capacity = 64
+	cfg.Calibration.BaselinePath = filepath.Join(t.TempDir(), "baseline.json")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, Options{Duration: 3 * time.Second}, slog.New(slog.DiscardHandler))
+	}()
+
+	// Activity for the real sensors to observe on this host.
+	for i := range 25 {
+		path := filepath.Join(dir, fmt.Sprintf("doc%d.txt", i))
+		if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	err := <-done
+	if err != nil {
+		// A host with no usable user-space notification API cannot run the
+		// detector at all; that is the contract Run enforces, and it is not a
+		// failure of the wiring this test is about.
+		if strings.Contains(err.Error(), "no sensor could start") {
+			t.Skipf("this host exposes no usable sensor: %v", err)
+		}
+		t.Fatalf("Run: %v", err)
 	}
 }

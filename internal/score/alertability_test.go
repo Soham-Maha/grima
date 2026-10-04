@@ -31,6 +31,7 @@ func alertabilityBaseline() *calibrate.Baseline {
 		},
 		WriteRateByProc: map[string]float64{},
 		WriteRate:       calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
+		CreateRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		RenameRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		DeleteRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		FileEventRate:   calibrate.Dist{Mean: 20, StdDev: 2, N: 100},
@@ -79,6 +80,10 @@ func soloCases() []soloCase {
 		{
 			signal: "write_burst", class: ClassPrimary, weight: 1.0,
 			mutate: func(tv *fingerprint.TreeVector) { tv.Writes = 1200 }, // 40/s vs 5/s
+		},
+		{
+			signal: "create_burst", class: ClassPrimary, weight: 0.6,
+			mutate: func(tv *fingerprint.TreeVector) { tv.Creates = 1200 }, // 40/s vs 5/s
 		},
 		{
 			signal: "write_rate_absolute", class: ClassPrimary, weight: 1.0,
@@ -348,4 +353,67 @@ func TestNovelExtensionAlertPointIsAccepted(t *testing.T) {
 		t.Errorf("the quiet-drip pair reached only %s (%.2f); a floor that raises the alert point has broken item 2.2",
 			v.Level, v.Score)
 	}
+}
+
+// The corroboration gate is structural, so it has to read "a Primary
+// contributed", not "a Primary was present". An operator muting a noisy Primary
+// by removing its weight entry must not silently restore Secondary-only fusion —
+// which is the 86.2 high verdict the gate exists to make impossible.
+func TestMutedPrimaryDoesNotOpenTheCorroborationGate(t *testing.T) {
+	saturatedSecondaries := func() fingerprint.TreeVector {
+		tv := alertabilityBase()
+		tv.Entropy = []fingerprint.EntropySample{{Ext: ".txt", H: 7.0}} // entropy_deviation
+		tv.Deletes = 1200
+		tv.CumBytesRewritten = 1 << 30
+		tv.CumFilesRewritten = 100
+		tv.Dirs = map[string]struct{}{}
+		for i := range 100 {
+			tv.Dirs[fmt.Sprintf("/data/d%d", i)] = struct{}{}
+		}
+		tv.NGram = fingerprint.NGram{
+			K: 32, Total: 89, Count: 89, Sequence: "file_write>file_rename",
+			RenameChains: 89, ChainShare: 1,
+		}
+		return tv
+	}
+
+	// The Primary is present in both runs; only its weight differs.
+	withWeight := config.Default()
+	muted := config.Default()
+	kept := make([]config.Weight, 0, len(muted.Scoring.Weights))
+	for _, w := range muted.Scoring.Weights {
+		if w.Name == "entropy_deviation" {
+			continue // the operator removed the entry to silence it
+		}
+		kept = append(kept, w)
+	}
+	muted.Scoring.Weights = kept
+
+	t.Run("muted Primary does not gate", func(t *testing.T) {
+		v := NewScorer(muted).Evaluate(Inputs{Tree: saturatedSecondaries(), Baseline: alertabilityBaseline()})
+
+		var primaryPresent bool
+		for _, sg := range v.Signals {
+			if sg.Class == ClassPrimary {
+				primaryPresent = true
+			}
+		}
+		if !primaryPresent {
+			t.Fatal("the fixture has no Primary; it is not measuring the gate")
+		}
+		if v.Score != 0 {
+			t.Fatalf("score = %.1f from Secondary signals alone; a muted Primary must not gate", v.Score)
+		}
+		if v.Level >= LevelLow {
+			t.Fatalf("level = %v, want info for Secondary-only evidence", v.Level)
+		}
+	})
+
+	t.Run("a contributing Primary does gate", func(t *testing.T) {
+		v := NewScorer(withWeight).Evaluate(Inputs{Tree: saturatedSecondaries(), Baseline: alertabilityBaseline()})
+
+		if v.Score <= 0 {
+			t.Fatalf("score = %.1f with a weighted Primary present; the gate should admit corroboration", v.Score)
+		}
+	})
 }

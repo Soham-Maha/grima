@@ -483,3 +483,141 @@ func TestRecalibrateWithoutABaselineCaptures(t *testing.T) {
 		t.Fatalf("Load = (%v, %v), want the saved baseline", stored, err)
 	}
 }
+
+// Ready is one gate over the whole baseline, so it cannot say which deviation
+// signals have a distribution behind them. Coverage reports the sample counts
+// that answer that question, and a zero must read as "unavailable", not "quiet".
+func TestCoverageReportsSamplesPerDistribution(t *testing.T) {
+	baseline := sampleBaseline()
+	baseline.RenameRate = Dist{Mean: 0, StdDev: 0, N: 7}
+	baseline.DeleteRate = Dist{Mean: 0, StdDev: 0, N: 7}
+	baseline.WriteRate = Dist{Mean: 3, StdDev: 1, N: 9}
+	// DirFanout is left at its zero value: nothing measured it.
+
+	cov := baseline.Coverage()
+
+	for name, want := range map[string]int{
+		"entropy":     50,
+		"write_rate":  9,
+		"rename_rate": 7,
+		"delete_rate": 7,
+		"dir_fanout":  0,
+	} {
+		if got := cov[name]; got != want {
+			t.Errorf("coverage[%s] = %d, want %d", name, got, want)
+		}
+	}
+
+	// A zero sample count is the signal saying it cannot be computed, so it must
+	// be present in the map rather than missing from it.
+	if _, ok := cov["dir_fanout"]; !ok {
+		t.Error("an unmeasured distribution is absent from coverage, not reported as zero")
+	}
+}
+
+func TestNilBaselineHasNoCoverage(t *testing.T) {
+	var baseline *Baseline
+	if cov := baseline.Coverage(); cov != nil {
+		t.Fatalf("nil baseline coverage = %v, want nil", cov)
+	}
+}
+
+// Each per-kind rate counts one kind. Counting creates as writes made the
+// denominator a superset of the write signal's numerator, which halves the
+// apparent deviation of a create-heavy workload and makes the same workload
+// score differently under host and audit attribution. Creates get their own
+// rate, which is what create_burst compares against.
+func TestBaselineSplitsWritesFromCreates(t *testing.T) {
+	cfg := config.Default()
+	obs := NewObservations()
+	at := time.Now()
+
+	for range 10 {
+		obs.Observe(event.Event{Kind: event.KindFileWrite, Path: "/data/a.txt", Time: at})
+	}
+	for range 30 {
+		obs.Observe(event.Event{Kind: event.KindFileCreate, Path: "/data/b.txt", Time: at})
+	}
+
+	baseline := obs.Baseline(cfg, time.Minute)
+
+	if got := baseline.WriteRate.Mean; got != 10 {
+		t.Errorf("write rate = %v, want 10/s: creates must not be counted as writes", got)
+	}
+	if got := baseline.CreateRate.Mean; got != 30 {
+		t.Errorf("create rate = %v, want 30/s", got)
+	}
+	if got := baseline.FileEventRate.Mean; got != 40 {
+		t.Errorf("file event rate = %v, want 40/s", got)
+	}
+}
+
+// The create rate is a measured distribution like any other, so recalibration
+// has to pool it rather than drop it.
+func TestMergePoolsTheCreateRate(t *testing.T) {
+	existing := sampleBaseline()
+	existing.CreateRate = Dist{Mean: 4, StdDev: 1, N: 10}
+
+	fresh := sampleBaseline()
+	fresh.CreateRate = Dist{Mean: 8, StdDev: 1, N: 10}
+
+	if _, err := existing.Merge(fresh); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	if existing.CreateRate.N != 20 {
+		t.Fatalf("create rate samples = %d, want 20", existing.CreateRate.N)
+	}
+	if got := existing.CreateRate.Mean; got <= 4 || got >= 8 {
+		t.Fatalf("create rate mean = %v, want a pooled value between 4 and 8", got)
+	}
+}
+
+// A baseline file carries the settings it was captured with, so a tightened knob
+// used to validate and then do nothing until the next --calibrate. Tightening
+// takes effect on the next run; loosening still needs a re-capture, because that
+// is the direction that could silently weaken a running detector.
+func TestApplyConfigTightensButNeverLoosens(t *testing.T) {
+	baseline := sampleBaseline() // sigma floor 0.05, min samples 2
+	cfg := config.Default()
+	cfg.Calibration.EntropySigmaFloor = 0.5
+	cfg.Calibration.MinSamples = 100
+
+	tightened := ApplyConfig(baseline, cfg)
+	if len(tightened) != 2 {
+		t.Fatalf("tightened = %v, want both settings", tightened)
+	}
+	if baseline.SigmaFloor != 0.5 {
+		t.Errorf("sigma floor = %v, want the configured 0.5", baseline.SigmaFloor)
+	}
+	if baseline.MinSamples != 100 {
+		t.Errorf("min samples = %d, want the configured 100", baseline.MinSamples)
+	}
+	// The tightened threshold now applies: 50 entropy samples no longer clear it.
+	if baseline.Ready() {
+		t.Error("a baseline with 50 entropy samples is ready at a threshold of 100")
+	}
+}
+
+func TestApplyConfigLeavesALooserConfigurationAlone(t *testing.T) {
+	baseline := sampleBaseline()
+	baseline.SigmaFloor = 0.5
+	baseline.MinSamples = 100
+
+	cfg := config.Default() // 0.05 and 200... only the floor is looser here
+	cfg.Calibration.EntropySigmaFloor = 0.01
+	cfg.Calibration.MinSamples = 10
+
+	if tightened := ApplyConfig(baseline, cfg); len(tightened) != 0 {
+		t.Fatalf("tightened = %v, want nothing: the stored settings are already stricter", tightened)
+	}
+	if baseline.SigmaFloor != 0.5 {
+		t.Errorf("sigma floor = %v, want the stored 0.5", baseline.SigmaFloor)
+	}
+}
+
+func TestApplyConfigHandlesNoBaseline(t *testing.T) {
+	if tightened := ApplyConfig(nil, config.Default()); tightened != nil {
+		t.Fatalf("tightened = %v for a nil baseline", tightened)
+	}
+}

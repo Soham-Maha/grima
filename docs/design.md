@@ -240,17 +240,18 @@ type Signal struct {
 | 1 | `entropy_deviation` | Primary | `EntropyByExt[ext]` | Implemented |
 | 2 | `magic_mismatch` | Primary | none | Implemented |
 | 3 | `write_burst` | Primary | `WriteRateByProc[name]`, falling back to `WriteRate` | Implemented |
-| 4 | `rename_burst` | Primary | `RenameRate` | Implemented |
-| 5 | `unknown_extension_activity` | Primary | `KnownExt` | Implemented |
-| 6 | `delete_rate` | Secondary | `DeleteRate` | Implemented |
-| 7 | `dir_fanout` | Secondary | `DirFanout` | Implemented |
-| 8 | `cum_bytes_rewritten` | Secondary | none | Implemented |
-| 9 | `write_rate_absolute` | Primary | none — uncalibrated fallback only | Implemented |
-| 10 | `persistence_install` | Override | none | Implemented (rule `R-PERSIST-INSTALL`) |
-| 11 | `static_reputation` | Secondary | none | **Phase 7** — not yet emitted |
-| 12 | `decoy_touch` | Override | none | Implemented (rule `R-DECOY-TOUCH`) |
-| 13 | `bus_drops` | Secondary | none | Implemented |
-| 14 | `ngram_rename_chain` | Secondary | none — the window's own sequence | Implemented |
+| 4 | `create_burst` | Primary | `CreateRate` | Implemented |
+| 5 | `rename_burst` | Primary | `RenameRate` | Implemented |
+| 6 | `unknown_extension_activity` | Primary | `KnownExt` | Implemented |
+| 7 | `delete_rate` | Secondary | `DeleteRate` | Implemented |
+| 8 | `dir_fanout` | Secondary | `DirFanout` | Implemented |
+| 9 | `cum_bytes_rewritten` | Secondary | none | Implemented |
+| 10 | `write_rate_absolute` | Primary | none — uncalibrated fallback only | Implemented |
+| 11 | `persistence_install` | Override | none | Implemented (rule `R-PERSIST-INSTALL`) |
+| 12 | `static_reputation` | Secondary | none | **Phase 7** — not yet emitted |
+| 13 | `decoy_touch` | Override | none | Implemented (rule `R-DECOY-TOUCH`) |
+| 14 | `bus_drops` | Secondary | none | Implemented |
+| 15 | `ngram_rename_chain` | Secondary | none — the window's own sequence | Implemented |
 
 ### Normalization rules
 
@@ -266,17 +267,52 @@ type Signal struct {
   signal list rather than reported as `0`. Reporting `0` would misrepresent *unknown* as
   *benign*. Signals that read the window's own contents — `magic_mismatch`,
   `cum_bytes_rewritten`, `bus_drops`, `ngram_rename_chain` — are available either way.
+- **`bus_drops` reports the window, not the run.** The signal is fed the drops that
+  happened since the previous scoring tick, because that is the loss that made *this*
+  window under-count. A lifetime counter was fed instead, so a single overload episode
+  marked every verdict for the rest of the process's life: every root carried a permanent
+  ≤20% inflation, and since a verdict with any signal is published, the bounded history ring
+  filled with info-level noise and buried real findings. The lifetime total stays where it
+  belongs, in `/healthz` as `bus.dropped`.
 - `write_rate_absolute` exists precisely because omitting deviation signals leaves
   uncalibrated mode thin. It is a fixed bulk-modification threshold
-  (`scoring.absolute_write_rate`, default 20 writes/s) and is superseded by
-  `write_burst` the moment a baseline exists.
+  (`scoring.absolute_write_rate`, default 20/s) counting **writes and creates**, because bulk
+  modification is what it thresholds and a create-only storm is bulk modification. It is
+  superseded by `write_burst` and `create_burst` the moment a baseline exists.
 - `Detail` strings must state the measured value and the comparison, never just a score.
 - **Rates compare like with like.** Each burst signal is measured against a baseline of the
-  same kind — writes against `WriteRate`, renames against `RenameRate` — and the baselines
-  count **file events only**. An earlier version kept one all-event rate; on a host with 404
-  processes that was dominated by process events (92.5/s measured), so a 65-file burst at
-  2.2 writes/s could never reach its threshold and `write_burst` was unreachable on a real
-  machine. A subset rate must never be compared against a superset baseline.
+  same kind — writes against `WriteRate`, creates against `CreateRate`, renames against
+  `RenameRate` — and each rate counts one event kind and only that kind. An earlier version
+  kept one all-event rate; on a host with 404 processes that was dominated by process events
+  (92.5/s measured), so a 65-file burst at 2.2 writes/s could never reach its threshold and
+  `write_burst` was unreachable on a real machine. A subset rate must never be compared
+  against a superset baseline, and the converse holds too: counting creates as writes made
+  the write denominator a superset of the write numerator, which halved the apparent
+  deviation of a create-heavy workload and made host and audit attribution disagree about
+  the same one. `CreateRate` is what `create_burst` reads; `WriteRate` counts writes alone.
+- **Creates are counted, so they are scored.** A process that only creates files — an
+  unpacker, a restore, a locker writing a note in every directory — writes nothing the write
+  counter records. `TreeVector.Creates` was populated and read by no signal, so a create-only
+  storm was invisible in both modes: measured, **12,026 create events in one second produced
+  no verdict at all**. `create_burst` closes that, and the uncalibrated fallback counts
+  creates because with no baseline there is no create rate to compare against.
+- **A measured zero rate is not an absent one.** A warm-up on a quiet host records
+  `rename_rate = 0` and `delete_rate = 0`, which is a measurement: the host never performed
+  the action. Comparing a burst against that zero disables the signal — division by zero if
+  taken literally, and in the shipped code an early return — so the one signal that could
+  see a rename storm on a quiet host stayed dead for the life of the deployment while
+  `/healthz` reported `calibration_ready: true`. Measured consequence: **80 renames in one
+  second produced no verdict at all** on a host calibrated during a quiet window.
+  A zero-mean distribution is therefore floored at the smallest burst that counts as
+  evidence (`scoring.zero_baseline_burst`, default 25 events per window), which keeps the
+  ratio finite and the signal available while stopping one ordinary event from saturating
+  it: the same host stays silent through an editor's occasional atomic save and still sees
+  a mass rename.
+- **No samples is different from zero.** A distribution with `N == 0` was never measured,
+  so the signal reading it is omitted even when the activity is enormous. `Ready()` is a
+  single gate over the whole baseline and cannot express this; `Baseline.Coverage()` reports
+  the sample count behind each distribution, and `/healthz` publishes them as
+  `baseline_samples_*` so that "calibrated" is not read as "every signal is live".
 
 ### Why `unknown_extension_activity` rather than a rename signal
 
@@ -347,8 +383,11 @@ func (e *Engine) Live() int
   race where a file is renamed before the sensor can read it.
 - `Aggregate(root)` sums the fingerprint of `root` and every descendant, and is what
   scoring consumes.
-- `Reap(pid)` releases state on `KindProcessExit`, re-parenting orphans to root rather
-  than dropping them from the tree.
+- `Reap(pid)` releases state on `KindProcessExit`, unlinks the process from its parent's
+  child set, and re-parents orphans to root rather than dropping them from the tree. The
+  unlink is what keeps the child index bounded by live processes: without it a long-lived
+  parent accumulates one entry per process it ever spawned, and a reused PID is walked into
+  a tree it was never part of.
 - Events with `PID == 0` are **not discarded**: they go into a host-level fingerprint
   (`HostName`, PID 0) so their file-derived evidence still reaches scoring. Detection must
   not depend on attribution succeeding — see `sprints.md` §13.
@@ -366,8 +405,9 @@ type NGram struct {
     Total        int     // k-grams observed in the window
     Sequence     string  // the most frequent k-gram, reduced to its cycle when it repeats
     Count        int     // occurrences of Sequence
-    RenameChains int     // k-grams containing a write followed by a rename
-    ChainShare   float64 // RenameChains / Total
+    Pairs        int     // adjacent event pairs in the window
+    RenameChains int     // adjacent pairs that are a write followed by a rename
+    ChainShare   float64 // RenameChains / Pairs
 }
 ```
 
@@ -380,6 +420,15 @@ type NGram struct {
 - `Total == 0` means the window held fewer than `k` events — no observation, which is not
   the same as "no chains". The scorer emits the signal only when `Total` and
   `RenameChains` both clear a floor.
+- **The share is a density over adjacent pairs, not over k-grams.** A k-gram spans k−1
+  pairs, so counting the k-grams that merely *contain* a chain made the share a step
+  function: at the default `k = 32` a single write→rename adjacency lies inside up to 31
+  overlapping k-grams, so one ordinary rename in a short window measured 0.875 and
+  saturated the signal. Measured before the fix: 38 writes and one rename reached value
+  `1.0`. Pairs are what the claim "a quarter of the window is chains" is about, and the
+  signal's normalization is anchored to the shape a real encryptor produces — `create,
+  write, rename, create`, one transition in four — saturating at that density and starting
+  at a tenth of it. `Total` and `Sequence` still come from k-grams; only the share changed.
 - The tree aggregate reads one sequence over the whole tree (each member's in-window
   samples in walk order), so a split workload's shape survives aggregation rather than
   being averaged across children.
@@ -458,10 +507,12 @@ func (b *Baseline) Ready() bool
   (`N >= calibration.min_samples`). Before that, GRIMA runs in uncalibrated mode.
 - `StdDev` of `0` is replaced with a floor (`calibration.entropy_sigma_floor`, default
   `0.05`) to avoid division by zero on extensions that are always identical.
-- Persisted as JSON at `calibration.baseline_path`. **Schema version 2.** A version
-  mismatch is ignored rather than fatal, so a v1 baseline captured before the per-kind
-  rates existed puts the detector in uncalibrated mode and is re-captured by running
-  `--calibrate`.
+- Persisted as JSON at `calibration.baseline_path`. **Schema version 3.** A version
+  mismatch is ignored rather than fatal, so a v2 baseline captured before `create_rate`
+  existed puts the detector in uncalibrated mode and is re-captured by running
+  `--calibrate`. The bump is required rather than cosmetic: v2 counted creates as writes in
+  `WriteRate`, so an old file's write distribution is a superset of what `write_burst` now
+  measures against it.
 - `Recalibrate` observes a fresh window, merges it into an existing baseline with
   `Merge`, and returns the result. Reachable from the command line as `--recalibrate`;
   the detector exits after saving. This is the feedback edge in the architecture diagram.
@@ -532,9 +583,16 @@ func (s *Scorer) Evaluate(tv fingerprint.TreeVector, b *calibrate.Baseline) Verd
    leaves combinations unbounded and ties the tier's meaning to the band value. Measured with
    the shipped weights, all five Secondary signals saturated with no Primary present fused to
    86.2 high before the gate.
-2. **Override floor.** For each Override signal present, `level = max(level, rule_severity)`
-   and `Override` is set to the rule ID. Overrides are **never** combined; they set a
-   minimum.
+
+   The gate reads **contributed**, not *present*: a Primary whose weight is zero is not
+   evidence, so it does not open the gate. Otherwise an operator muting a noisy Primary by
+   removing its weight entry would silently restore the 86.2 verdict the gate exists to make
+   impossible — with the muted signal still listed in `Signals`, so the verdict would look
+   compliant while it was not.
+2. **Override floor.** For each Override signal present, `level = max(level, rule_severity)`.
+   Overrides are **never** combined; they set a minimum. `Override` names the highest-severity
+   rule among them, which is the rule that set the floor: rule hits arrive oldest-first, so
+   naming the first one reported a medium rule as the reason for a critical verdict.
 3. **Decay.** The decaying track's contribution is reduced by
    `exp(-Δt / decay_half_life)` when no further suspicious activity follows. The
    cumulative track is exempt.
@@ -641,8 +699,11 @@ identified by the verdict's tree root — the process, or the host when no proce
 claimed — and `response.alert_cooldown` holds further alerts for that root until it
 elapses. An incident ends when a verdict below `alert_min_level` reaches the responder
 (its next rise then alerts immediately), or, if the root stops carrying evidence
-entirely, when the cooldown elapses. A zero cooldown disables throttling and is the
-default, so alert emission is unchanged unless opted into. Throttling gates only the
+entirely, when the cooldown elapses. A zero cooldown disables throttling and is the binary's
+default, so alert emission is unchanged unless opted into; the shipped example
+configuration sets `1m`, because a five-minute incident otherwise writes three hundred
+identical alert lines and buries everything else in the log. Throttling gates the alert log
+only — the verdict stream, the history and the dashboard are unaffected. Throttling gates only the
 alert log; the verdict stream and the dashboard are unaffected.
 
 ---
@@ -670,6 +731,8 @@ rescan_on_overflow   = true
 enabled        = true
 names          = ["_grima_canary.doc", "quarterly_report.xlsx"]
 count_per_dir  = 2
+max_depth      = 0                     # 0 plants in the monitored roots only
+manifest_path  = "grima-decoys.json"   # records what was planted, for --remove-decoys
 
 [window]
 decay_half_life = "30s"
@@ -700,6 +763,27 @@ enabled = true
 listen  = "127.0.0.1:8787"
 ```
 
+### Decoy planting is bounded and recorded
+
+Planting decoys writes real files into directories the operator monitors. That is a side
+effect on the filesystem, not only on the detector, so two rules apply:
+
+- **Depth is bounded and defaults to zero.** Decoys go in the monitored roots and nowhere
+  else unless `decoy.max_depth` asks for more. Recursing to depth 3 with `count_per_dir = 2`
+  writes two plausible-looking documents into *every* directory of the tree — measured at
+  **66 files across 33 directories from a three-second run** over a small tree — and on a
+  real home directory that is thousands of files appearing in the user's folders, their
+  version control and their backups, under names designed to look like the user's own work.
+- **Every planted path is recorded, and the run has an undo.** `decoy.manifest_path` is a
+  union across runs, so `grima --remove-decoys` removes decoys planted earlier, or under a
+  different depth, and works after a restart or a crash. Removal only deletes a file whose
+  contents are still the canary body: a path the user has since replaced with a real
+  document is left in place and reported as skipped. The manifest says where the tool wrote,
+  not that whatever is there now belongs to it.
+
+`decoy.manifest_path` is required while decoys are enabled — planting without a record is
+planting files that can never be removed.
+
 ---
 
 ## 12. Observability & Health
@@ -716,11 +800,30 @@ detector.
 | `watch.failures` | inotify watch exhaustion / RDCW overflow | `/healthz` |
 | `history.size` / `history.depth` | Verdicts held on the timeline | `/healthz`, dashboard |
 | `history.dropped` | Verdicts overwritten because the ring is full | `/healthz`, dashboard |
+| `sse.dropped` | Verdicts a live listener did not keep up with | `/healthz` |
 | `calibration.ready` | Whether deviation signals are active | dashboard banner |
 | `calibration.age` | Time since baseline capture | dashboard |
+| `baseline.samples.<dist>` | Samples behind each baseline distribution | `/healthz` |
 
 `/healthz` returns JSON. The dashboard shows a persistent banner while in uncalibrated
 mode, so an operator never mistakes "no alerts" for "calibrated and quiet."
+
+`calibration.ready` answers "is there a baseline?", not "is every signal live?". A baseline
+captured on a quiet host has no samples for some distributions, and the signals reading
+them are omitted — `baseline.samples.<dist>` is what distinguishes that from a quiet host.
+A zero there is an unavailable signal, not a silent one. `entropy_sigma_floor` and
+`min_samples` are the one exception to the file-wins rule: the stricter of the stored and
+the configured value applies, so tightening a knob takes effect on the next run rather than
+at the next `--calibrate`, and loosening it still requires a re-capture.
+
+### The latest-verdict view is current state
+
+`/api/verdicts` and `/api/trees` answer "what is happening now", so a verdict whose process
+has exited is dropped from them: a ghost at the top of the dashboard reads as present tense.
+The host pseudo-root is exempt — it is not a process that can exit, and in the shipped
+attribution mode most evidence is filed against it. What happened is the history ring's job,
+and it is unaffected. A live listener is a bounded queue like every other, so the verdicts a
+slow dashboard missed are counted in `sse.dropped` rather than lost silently.
 
 ### The verdict history
 

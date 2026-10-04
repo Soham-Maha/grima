@@ -24,7 +24,7 @@ import (
 
 // Version is the baseline schema version. A baseline whose version does not
 // match is ignored rather than fatal.
-const Version = 2
+const Version = 3
 
 // Dist is a measured distribution.
 type Dist struct {
@@ -49,7 +49,14 @@ type Baseline struct {
 	// compared subset rates against it; on a host with 400 processes the
 	// baseline was dominated by process events, so write_burst and its siblings
 	// could never reach their threshold.
+	//
+	// Each rate counts one event kind and only that kind. WriteRate counts
+	// writes, not writes-plus-creates: the signal numerator counts writes, and
+	// a subset rate compared against a superset baseline is the same defect in
+	// the other direction — it halves the apparent deviation of a create-heavy
+	// workload and makes host and audit attribution disagree about it.
 	WriteRate     Dist `json:"write_rate"`
+	CreateRate    Dist `json:"create_rate"`
 	RenameRate    Dist `json:"rename_rate"`
 	DeleteRate    Dist `json:"delete_rate"`
 	FileEventRate Dist `json:"file_event_rate"`
@@ -69,6 +76,60 @@ func (b *Baseline) Ready() bool {
 		total += d.N
 	}
 	return total >= b.MinSamples
+}
+
+// Coverage reports how many samples each distribution in the baseline was
+// measured from.
+//
+// Ready is a single gate over the whole baseline; it does not say that every
+// deviation signal has something to compare against. A zero here means the
+// signal reading that distribution is omitted — unknown, not quiet — so an
+// operator reading "calibrated" can see which of them those are.
+func (b *Baseline) Coverage() map[string]int {
+	if b == nil {
+		return nil
+	}
+	entropy := 0
+	for _, d := range b.EntropyByExt {
+		entropy += d.N
+	}
+	return map[string]int{
+		"entropy":     entropy,
+		"write_rate":  b.WriteRate.N,
+		"create_rate": b.CreateRate.N,
+		"rename_rate": b.RenameRate.N,
+		"delete_rate": b.DeleteRate.N,
+		"dir_fanout":  b.DirFanout.N,
+	}
+}
+
+// ApplyConfig reconciles a loaded baseline with the running configuration and
+// returns the names of the settings it tightened.
+//
+// The file records the settings it was captured with, and Load prefers them —
+// which meant an operator could raise entropy_sigma_floor or min_samples, see
+// the configuration validate, and get no warning and no effect until the next
+// --calibrate. A knob that is validated and then ignored is worse than no knob.
+//
+// The stricter of the stored and the configured value wins, so tightening takes
+// effect immediately and loosening still requires a re-capture, which is the
+// direction that cannot silently weaken a running detector. The caller is told
+// what changed so it can say so.
+func ApplyConfig(b *Baseline, cfg config.Config) []string {
+	if b == nil {
+		return nil
+	}
+
+	var tightened []string
+	if cfg.Calibration.EntropySigmaFloor > b.SigmaFloor {
+		b.SigmaFloor = cfg.Calibration.EntropySigmaFloor
+		tightened = append(tightened, "entropy_sigma_floor")
+	}
+	if cfg.Calibration.MinSamples > b.MinSamples {
+		b.MinSamples = cfg.Calibration.MinSamples
+		tightened = append(tightened, "min_samples")
+	}
+	return tightened
 }
 
 // Sigma returns the standard deviation to use for an extension, applying the
@@ -102,6 +163,7 @@ func (b *Baseline) KnowsExt(ext string) bool {
 type secondCounts struct {
 	file   int
 	write  int
+	create int
 	rename int
 	delete int
 }
@@ -142,8 +204,10 @@ func (o *Observations) Observe(ev event.Event) {
 		counts := o.perSecond[second]
 		counts.file++
 		switch ev.Kind {
-		case event.KindFileWrite, event.KindFileCreate:
+		case event.KindFileWrite:
 			counts.write++
+		case event.KindFileCreate:
+			counts.create++
 		case event.KindFileRename:
 			counts.rename++
 		case event.KindFileDelete:
@@ -220,16 +284,19 @@ func (o *Observations) Baseline(cfg config.Config, elapsed time.Duration) *Basel
 
 	rates := make([]float64, 0, len(o.perSecond))
 	writes := make([]float64, 0, len(o.perSecond))
+	creates := make([]float64, 0, len(o.perSecond))
 	renames := make([]float64, 0, len(o.perSecond))
 	deletes := make([]float64, 0, len(o.perSecond))
 	for _, counts := range o.perSecond {
 		rates = append(rates, float64(counts.file))
 		writes = append(writes, float64(counts.write))
+		creates = append(creates, float64(counts.create))
 		renames = append(renames, float64(counts.rename))
 		deletes = append(deletes, float64(counts.delete))
 	}
 	bl.FileEventRate = distOf(rates)
 	bl.WriteRate = distOf(writes)
+	bl.CreateRate = distOf(creates)
 	bl.RenameRate = distOf(renames)
 	bl.DeleteRate = distOf(deletes)
 
@@ -371,6 +438,7 @@ func (b *Baseline) Merge(fresh *Baseline) (int, error) {
 
 	b.FileEventRate = poolDist(b.FileEventRate, fresh.FileEventRate)
 	b.WriteRate = poolDist(b.WriteRate, fresh.WriteRate)
+	b.CreateRate = poolDist(b.CreateRate, fresh.CreateRate)
 	b.RenameRate = poolDist(b.RenameRate, fresh.RenameRate)
 	b.DeleteRate = poolDist(b.DeleteRate, fresh.DeleteRate)
 	b.DirFanout = poolDist(b.DirFanout, fresh.DirFanout)

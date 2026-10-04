@@ -166,6 +166,37 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Source: https://cs.opensource.google/go/x/sys
 
+### Transitive dependencies
+
+These are required by the direct dependencies above and are statically linked into the
+binary on the platforms that use them. They are listed because the shipped artifact
+contains their code: a notices file that covers four of the eleven modules in `go.mod`
+understates what is being distributed. Each entry gives the license and a stable link to
+the pinned license text, per the convention at the end of this file.
+
+| Module | Used for | License | Copyright |
+|---|---|---|---|
+| `github.com/ebitengine/purego` v0.10.2 | Dynamic symbol binding on platforms without cgo (gopsutil) | Apache-2.0 | The Ebitengine Authors |
+| `github.com/go-ole/go-ole` v1.2.6 | COM bindings for the Windows telemetry path | MIT | © 2013-2017 Yasuhiro Matsumoto |
+| `github.com/lufia/plan9stats` v0.0.0-20211012122336-39d0f177ccd0 | Plan 9 process statistics (gopsutil) | BSD-3-Clause | © 2019 KADOTA, Kyohei |
+| `github.com/power-devops/perfstat` v0.0.0-20240221224432-82ca36839d55 | AIX performance statistics (gopsutil) | MIT | © 2020 Power DevOps |
+| `github.com/tklauser/go-sysconf` v0.3.16 | `sysconf` bindings for CPU count (gopsutil) | BSD-3-Clause | © 2018-2022 Tobias Klauser |
+| `github.com/tklauser/numcpus` v0.11.0 | CPU-count discovery on Linux (gopsutil) | Apache-2.0 | The numcpus Authors |
+| `github.com/yusufpapurcu/wmi` v1.2.4 | WMI queries for Windows process and service data | MIT | © 2013 Stack Exchange |
+
+License texts:
+
+- `purego`: https://github.com/ebitengine/purego/blob/v0.10.2/LICENSE
+- `go-ole`: https://github.com/go-ole/go-ole/blob/v1.2.6/LICENSE
+- `plan9stats`: https://github.com/lufia/plan9stats/blob/v0.0.0-20211012122336-39d0f177ccd0/LICENSE
+- `perfstat`: https://github.com/power-devops/perfstat/blob/v0.0.0-20240221224432-82ca36839d55/LICENSE
+- `go-sysconf`: https://github.com/tklauser/go-sysconf/blob/v0.3.16/LICENSE
+- `numcpus`: https://github.com/tklauser/numcpus/blob/v0.11.0/LICENSE
+- `wmi`: https://github.com/yusufpapurcu/wmi/blob/v1.2.4/LICENSE
+
+None is copyleft, so none relicenses the project. Adding a module to `go.mod` means adding
+it here in the same commit.
+
 ---
 
 ## Adapted detection logic

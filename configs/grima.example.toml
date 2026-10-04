@@ -81,9 +81,30 @@ audit_setup = true
 [decoy]
 # Canary files. A legitimate process has no reason to touch a file the user
 # never created, which makes this the highest-precision signal available.
+#
+# Planting writes real files into the directories you monitor. That is a side
+# effect on your filesystem, not just on the detector, so it is bounded and it
+# is recorded:
 enabled = true
 names = ["_grima_canary.doc", "quarterly_report_2019.xlsx", "invoices_backup.pdf"]
 count_per_dir = 2
+
+# How far below each monitored root decoys are planted. 0 means the monitored
+# directories themselves and nothing deeper, which is the default because the
+# alternative writes two files into every directory of the tree — on a real home
+# directory that is thousands of plausible-looking documents appearing in your
+# folders, your version control and your backups.
+max_depth = 0
+
+# Every planted path is recorded here, so the run can be undone:
+#
+#   grima --config <this> --remove-decoys
+#
+# removes exactly the files this manifest lists, and only while their contents
+# are still the canary body — a decoy you replaced with a real document is left
+# alone. The manifest is a union across runs, so decoys planted earlier, or
+# under a different max_depth, are still removable.
+manifest_path = "grima-decoys.json"
 
 [window]
 # Decay for the burst track. The cumulative track never decays, which is what
@@ -110,6 +131,19 @@ level_bands = { low = 20, medium = 45, high = 70, critical = 88 }
 # available, so this only affects uncalibrated mode.
 absolute_write_rate = 20
 
+# The smallest number of events in a window that counts as a burst when the
+# host's measured rate for that event kind is zero.
+#
+# A zero rate is a measurement, not a missing one: a warm-up on a quiet machine
+# records zero renames, and a burst signal compared against that zero would
+# either divide by zero or be switched off for the life of the deployment —
+# leaving the one signal that could see a rename storm permanently dead while
+# health still reported the baseline as ready. The floor keeps the signal live
+# without letting a single ordinary event saturate it: a host that never renames
+# stays silent through an editor's occasional atomic save, and still sees a mass
+# rename.
+zero_baseline_burst = 25
+
 # Fusion weights. These defaults are a starting point; Phase 6 replaces them
 # with values from a grid search over the scenario corpus.
 [[scoring.weights]]
@@ -121,6 +155,16 @@ weight = 1.0
 [[scoring.weights]]
 name = "write_burst"
 weight = 1.0
+# Creates per second against the host's measured create rate. A process that only
+# creates files — an unpacker, a restore, a locker writing a note per directory —
+# writes nothing the write counter records, so without this signal a create-only
+# storm is invisible. Weighted below write_burst because a create-only burst is
+# the weakest of the burst shapes: at 0.6 a saturated burst reaches the medium
+# band alone, and the host's own create rate is what keeps a machine that
+# unpacks all day quiet.
+[[scoring.weights]]
+name = "create_burst"
+weight = 0.6
 [[scoring.weights]]
 name = "write_rate_absolute"
 weight = 1.0
@@ -180,9 +224,15 @@ alert_min_level = "medium"
 
 # Throttle repeat alerts for one incident. An incident is identified by the
 # verdict's tree root — the process, or the host — and is cleared when severity
-# drops below alert_min_level or when the cooldown elapses. "0s" (the default)
-# disables throttling, so every scoring tick over the band logs an alert.
-alert_cooldown = "0s"
+# drops below alert_min_level or when the cooldown elapses.
+#
+# One minute here rather than the binary's own "0s" default, which disables
+# throttling: the score loop emits a verdict every second, so an incident that
+# lasts five minutes writes three hundred identical alert lines and buries
+# everything else in the log. Throttling gates the alert log only — the verdict
+# stream, the history and the dashboard are unaffected — so a shorter cooldown
+# costs nothing but noise. Set "0s" to log every tick.
+alert_cooldown = "1m"
 
 [web]
 enabled = true

@@ -86,6 +86,25 @@ Anything outside that list is invisible to the detector, and GRIMA **rejects unk
 configuration keys** rather than ignoring them, so a typo fails at startup instead of
 silently disabling a setting.
 
+### Decoys write files into the directories you monitor
+
+GRIMA plants canary files so that a process touching one is caught immediately. That is a
+change to your filesystem, so it is worth knowing before the first run:
+
+- By default the canaries go in the monitored directories themselves and **nowhere deeper**
+  (`decoy.max_depth = 0`). Setting it higher plants `count_per_dir` files in every directory
+  down to that depth, which on a home directory is a lot of files.
+- Every planted path is recorded in `decoy.manifest_path` (default `grima-decoys.json`), and
+  the run is undone with:
+
+  ```sh
+  grima --config grima.toml --remove-decoys
+  ```
+
+  It removes exactly the recorded files, and only while their contents are still the canary
+  body — a decoy you replaced with a real document is left alone. Set `decoy.enabled = false`
+  to skip planting entirely.
+
 ### 2. Calibrate
 
 ```sh
@@ -282,7 +301,7 @@ documents every option. The settings that matter most:
 | `general.monitor_paths` | Directories to watch. Anything outside this set is invisible. |
 | `calibration.warmup` | How long to observe the host before deviation signals activate. |
 | `filewatch.startup_deadline` | How long startup may spend registering watches on a large tree; the rest are registered in the background and counted as `add_pending`. |
-| `response.alert_cooldown` | Hold repeat alerts for one incident. Off by default: a persistent condition logs on every scoring tick. |
+| `response.alert_cooldown` | Hold repeat alerts for one incident. The example ships `1m`; the binary's own default is `0s`, which logs an identical line on every scoring tick. |
 | `response.enable_suspend` | Off by default. Terminating processes on a heuristic score is a denial-of-service risk. |
 
 ## How it works

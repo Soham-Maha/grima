@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/bus"
@@ -24,9 +25,10 @@ import (
 
 // Options are the runtime knobs that come from the command line.
 type Options struct {
-	Duration    time.Duration
-	Calibrate   bool
-	Recalibrate bool
+	Duration     time.Duration
+	Calibrate    bool
+	Recalibrate  bool
+	RemoveDecoys bool
 }
 
 const sensorBuffer = 4096
@@ -37,6 +39,13 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, opts.Duration)
 		defer cancel()
+	}
+
+	// Removing decoys is a maintenance action, not a run: it touches the files
+	// this tool wrote and nothing else, so it happens before any sensor or bus
+	// exists.
+	if opts.RemoveDecoys {
+		return runRemoveDecoys(cfg, log)
 	}
 
 	policy, _ := bus.ParseDropPolicy(cfg.Bus.DropPolicy)
@@ -57,7 +66,11 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 		if err != nil {
 			log.Warn("decoy planting partially failed", "error", err)
 		}
-		log.Info("decoys planted", "count", planted)
+		log.Info("decoys planted",
+			"count", planted,
+			"manifest", cfg.Decoy.ManifestPath,
+			"max_depth", cfg.Decoy.MaxDepth,
+		)
 	}
 
 	sources, err := startSensors(ctx, cfg, host, events, log)
@@ -77,6 +90,12 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 	if err != nil {
 		log.Warn("baseline unreadable, running uncalibrated", "error", err)
 	}
+	// A baseline file carries the settings it was captured with, so a tightened
+	// knob would otherwise validate and then do nothing.
+	if tightened := calibrate.ApplyConfig(baseline, cfg); len(tightened) > 0 {
+		log.Warn("baseline was captured with looser settings; the configured values now apply",
+			"fields", tightened, "path", cfg.Calibration.BaselinePath)
+	}
 	if baseline == nil || !baseline.Ready() {
 		log.Warn("no usable baseline: deviation signals are inactive until one is captured",
 			"path", cfg.Calibration.BaselinePath)
@@ -89,11 +108,15 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 	overrides := newOverrideTracker(cfg.Window.DecayHalfLife.Std())
 
 	startedAt := time.Now()
+
+	// The engine is owned by the loop below, so anything outside it reads this
+	// published count rather than the engine itself. Staleness is bounded by the
+	// scoring interval.
+	var live atomic.Int64
 	hub := web.NewHub(func() web.Health {
-		return healthSnapshot(startedAt, events, sources, engine, baseline)
+		return healthSnapshot(startedAt, events, sources, int(live.Load()), baseline)
 	})
 
-	startFingerprintLoop(ctx, engine, events.Subscribe("fingerprint", cfg.Bus.Capacity/2))
 	startRuleLoop(ctx, ruleEngine, overrides, events.Subscribe("rules", cfg.Bus.Capacity))
 
 	if cfg.Web.Enabled {
@@ -108,17 +131,25 @@ func Run(ctx context.Context, cfg config.Config, opts Options, log *slog.Logger)
 		}()
 	}
 
-	runScoreLoop(ctx, scoreLoop{
-		cfg:       cfg,
-		events:    events,
-		engine:    engine,
-		scorer:    scorer,
-		overrides: overrides,
-		responder: responder,
-		hub:       hub,
-		baseline:  baseline,
-		log:       log,
-	})
+	loop := engineLoop{
+		scoreLoop: scoreLoop{
+			cfg:       cfg,
+			events:    events,
+			engine:    engine,
+			scorer:    scorer,
+			overrides: overrides,
+			responder: responder,
+			hub:       hub,
+			baseline:  baseline,
+			log:       log,
+		},
+		in:   events.Subscribe("fingerprint", cfg.Bus.Capacity/2),
+		live: &live,
+	}
+	// Seed the published count on this goroutine: the loop has not started, so
+	// there is no writer to race with yet.
+	live.Store(int64(engine.Live()))
+	loop.run(ctx)
 
 	log.Info("grima stopped",
 		"published", events.Stats().Published,
@@ -165,6 +196,25 @@ func pumpToBus(ctx context.Context, out <-chan event.Event, events *bus.Bus) {
 			events.Publish(ev)
 		}
 	}
+}
+
+// runRemoveDecoys deletes the canary files a previous run planted, using the
+// manifest that run wrote. It is the undo for a tool that writes into the user's
+// directories.
+func runRemoveDecoys(cfg config.Config, log *slog.Logger) error {
+	removed, skipped, err := decoy.Remove(cfg.Decoy.ManifestPath)
+	if err != nil {
+		return fmt.Errorf("remove decoys: %w", err)
+	}
+
+	log.Info("decoys removed", "removed", removed, "manifest", cfg.Decoy.ManifestPath)
+	if skipped > 0 {
+		// A skipped path held something that is not the canary body any more.
+		// Deleting it would delete the user's file, so it is left and reported.
+		log.Warn("some recorded decoys were left in place: their contents are no longer the canary body",
+			"skipped", skipped)
+	}
+	return nil
 }
 
 func runCalibration(ctx context.Context, cfg config.Config, events *bus.Bus, log *slog.Logger) error {

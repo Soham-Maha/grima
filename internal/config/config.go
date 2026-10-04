@@ -94,6 +94,16 @@ type DecoyConfig struct {
 	Enabled     bool     `toml:"enabled"`
 	Names       []string `toml:"names"`
 	CountPerDir int      `toml:"count_per_dir"`
+	// MaxDepth bounds how far below each monitored root decoys are planted.
+	// Zero plants only in the roots themselves. Recursing writes files into the
+	// user's directories — two per directory — so it is opt-in rather than the
+	// default.
+	MaxDepth int `toml:"max_depth"`
+	// ManifestPath records every path planted, so --remove-decoys can undo this
+	// run and earlier ones. Without it a decoy planted before a crash, or under
+	// a different configuration, is indistinguishable from the user's own file
+	// and is never removed.
+	ManifestPath string `toml:"manifest_path"`
 }
 
 // WindowConfig holds fingerprint window settings.
@@ -130,7 +140,14 @@ type ScoringConfig struct {
 	// AbsoluteWriteRate is the writes-per-second threshold used when no host
 	// baseline exists. It is replaced by the calibrated write_burst signal as
 	// soon as a baseline is available.
-	AbsoluteWriteRate float64  `toml:"absolute_write_rate"`
+	AbsoluteWriteRate float64 `toml:"absolute_write_rate"`
+	// ZeroBaselineBurst is the smallest number of events in a window that
+	// counts as a burst when the host's measured rate for that event kind is
+	// zero. A zero rate is a measurement, not an absence of one: it says the
+	// host never did this during warm-up, so there is no multiple to express
+	// tolerance in. The floor keeps the deviation signal available instead of
+	// disabling it, while stopping one ordinary event from saturating it.
+	ZeroBaselineBurst float64  `toml:"zero_baseline_burst"`
 	Weights           []Weight `toml:"weights"`
 }
 
@@ -186,6 +203,14 @@ var DefaultSignalWeights = []Weight{
 	{Name: "entropy_deviation", Weight: 1.0},
 	{Name: "magic_mismatch", Weight: 1.0},
 	{Name: "write_burst", Weight: 1.0},
+	// create_burst is a Primary, but a create-only burst is the weakest of the
+	// three burst shapes: an extractor, installer or restore creates thousands of
+	// files and writes nothing the window sees as a write. At 0.6 a saturated
+	// create burst reaches the medium band alone, which is why the calibration is
+	// the defence rather than the weight — a host where unpacking is normal has
+	// the create rate to match. Phase 6's ablation has to price it per scenario
+	// before the paper cites it, as it does for ngram_rename_chain.
+	{Name: "create_burst", Weight: 0.6},
 	{Name: "write_rate_absolute", Weight: 1.0},
 	{Name: "rename_burst", Weight: 0.8},
 	{Name: "ngram_rename_chain", Weight: 0.2},
@@ -239,9 +264,11 @@ func Default() Config {
 			AuditSetup: true,
 		},
 		Decoy: DecoyConfig{
-			Enabled:     true,
-			Names:       []string{"_grima_canary.doc", "quarterly_report_2019.xlsx", "invoices_backup.pdf"},
-			CountPerDir: 2,
+			Enabled:      true,
+			Names:        []string{"_grima_canary.doc", "quarterly_report_2019.xlsx", "invoices_backup.pdf"},
+			CountPerDir:  2,
+			MaxDepth:     0,
+			ManifestPath: "grima-decoys.json",
 		},
 		Window: WindowConfig{
 			DecayHalfLife: Duration(30 * time.Second),
@@ -256,6 +283,7 @@ func Default() Config {
 		Scoring: ScoringConfig{
 			LevelBands:        Bands{Low: 20, Medium: 45, High: 70, Critical: 88},
 			AbsoluteWriteRate: 20,
+			ZeroBaselineBurst: 25,
 			Weights:           DefaultSignalWeights,
 		},
 		Rules: RulesConfig{
@@ -337,6 +365,16 @@ func (c Config) Validate() error {
 	}
 	if c.Scoring.AbsoluteWriteRate <= 0 {
 		return fmt.Errorf("scoring.absolute_write_rate must be positive, got %v", c.Scoring.AbsoluteWriteRate)
+	}
+	if c.Scoring.ZeroBaselineBurst <= 0 {
+		return fmt.Errorf("scoring.zero_baseline_burst must be positive, got %v", c.Scoring.ZeroBaselineBurst)
+	}
+	if c.Decoy.MaxDepth < 0 {
+		return fmt.Errorf("decoy.max_depth must not be negative, got %d", c.Decoy.MaxDepth)
+	}
+	if c.Decoy.Enabled && c.Decoy.ManifestPath == "" {
+		// Planting without a manifest is planting files that cannot be removed.
+		return fmt.Errorf("decoy.manifest_path must be set while decoys are enabled")
 	}
 	if err := c.validateAttribution(); err != nil {
 		return err

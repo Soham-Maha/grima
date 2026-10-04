@@ -40,6 +40,13 @@ jobs:
       - name: build
         run: make build
 
+      # The claim is "one source, four platforms". Building only the host's own
+      # GOOS/GOARCH leaves three of them to bit-rot — a build tag typo in a
+      # darwin or arm64 file compiles nowhere until a user tries it. This is the
+      # step that makes the cross-platform claim evidence rather than assertion.
+      - name: cross-compile every platform
+        run: make cross
+
       - name: confirm static linking
         run: |
           file ./grima

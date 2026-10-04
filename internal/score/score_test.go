@@ -22,6 +22,7 @@ func testBaseline() *calibrate.Baseline {
 		},
 		WriteRateByProc: map[string]float64{},
 		WriteRate:       calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
+		CreateRate:      calibrate.Dist{Mean: 5, StdDev: 1, N: 100},
 		RenameRate:      calibrate.Dist{Mean: 2, StdDev: 1, N: 100},
 		DeleteRate:      calibrate.Dist{Mean: 2, StdDev: 1, N: 100},
 		FileEventRate:   calibrate.Dist{Mean: 12, StdDev: 2, N: 100},
@@ -362,7 +363,7 @@ func TestNGramRenameChainReachesTheVerdict(t *testing.T) {
 	if sg.Value != 1 {
 		t.Fatalf("signal value = %.2f, want 1 for a window that is all chains", sg.Value)
 	}
-	if !strings.Contains(sg.Detail, "4-grams") {
+	if !strings.Contains(sg.Detail, "4-gram") {
 		t.Fatalf("detail %q does not report the configured n-gram length", sg.Detail)
 	}
 	// Item 4.9 changed this signal's class contract. `ngram_rename_chain` is
@@ -422,5 +423,88 @@ func TestBusDropsBelowTheNoiseFloorAreNotEvidence(t *testing.T) {
 				t.Fatalf("bus_drops present with %d drops (value %v)", dropped, sg.Value)
 			}
 		}
+	}
+}
+
+// The override a verdict reports must be the one that set its floor. Rule hits
+// arrive oldest-first, so a medium rule recorded before a critical one used to
+// be named as the reason for a critical verdict.
+func TestOverrideNamesTheRuleThatSetTheFloor(t *testing.T) {
+	scorer := NewScorer(config.Default())
+
+	v := scorer.Evaluate(Inputs{
+		Tree: fingerprint.TreeVector{Root: 1, ProcName: "encryptor", WindowDuration: time.Second},
+		Overrides: []Override{
+			{ID: "R-PERSIST-INSTALL", Level: LevelMedium, Detail: "persistence installed"},
+			{ID: "R-DECOY-TOUCH", Level: LevelCritical, Detail: "canary touched"},
+		},
+	})
+
+	if v.Level != LevelCritical {
+		t.Fatalf("level = %v, want critical from the decoy rule", v.Level)
+	}
+	if v.Override != "R-DECOY-TOUCH" {
+		t.Fatalf("override = %q, want the rule that set the floor (R-DECOY-TOUCH)", v.Override)
+	}
+}
+
+// With no rule raising the floor, the override is still reported for context.
+func TestOverrideReportsTheOnlyRuleWhenNoneRaisesTheFloor(t *testing.T) {
+	scorer := NewScorer(config.Default())
+
+	v := scorer.Evaluate(Inputs{
+		Tree:      fingerprint.TreeVector{Root: 1, ProcName: "installer", WindowDuration: time.Second},
+		Overrides: []Override{{ID: "R-PERSIST-INSTALL", Level: LevelMedium, Detail: "persistence installed"}},
+	})
+
+	if v.Override != "R-PERSIST-INSTALL" {
+		t.Fatalf("override = %q, want R-PERSIST-INSTALL", v.Override)
+	}
+	if v.Level != LevelMedium {
+		t.Fatalf("level = %v, want medium", v.Level)
+	}
+}
+
+// The chain share is a density, so a few chains in a long window are ordinary
+// file management and must not read as a pattern. Under the k-gram formulation
+// these four chains would have been counted once per overlapping k-gram and
+// saturated the signal.
+func TestFewChainsInALongWindowDoNotFireTheSignal(t *testing.T) {
+	scorer := NewScorer(config.Default())
+
+	tv := fingerprint.TreeVector{
+		Root: 1, ProcName: "editor", WindowDuration: window,
+		NGram: fingerprint.NGram{
+			K: 32, Total: 73, Pairs: 103, RenameChains: 4,
+			ChainShare: 4.0 / 103.0, Sequence: "file_write", Count: 60,
+		},
+	}
+
+	if sg, ok := signalsByName(scorer.Evaluate(Inputs{Tree: tv, Baseline: testBaseline()}))["ngram_rename_chain"]; ok {
+		t.Fatalf("four chains in a hundred transitions produced %v", sg.Value)
+	}
+}
+
+// The shape a real encryptor produces — one transition in four, because the
+// rename's destination arrives as its own create — still saturates it.
+func TestEncryptorCycleSaturatesTheChainSignal(t *testing.T) {
+	scorer := NewScorer(config.Default())
+
+	tv := fingerprint.TreeVector{
+		Root: 1, ProcName: "cryptor", WindowDuration: window,
+		NGram: fingerprint.NGram{
+			K: 32, Total: 73, Pairs: 120, RenameChains: 40,
+			ChainShare: 40.0 / 120.0, Sequence: "file_create>file_write>file_rename", Count: 40,
+		},
+	}
+
+	sg, ok := signalsByName(scorer.Evaluate(Inputs{Tree: tv, Baseline: testBaseline()}))["ngram_rename_chain"]
+	if !ok {
+		t.Fatal("the encryptor cycle did not fire the chain signal")
+	}
+	// Saturation lands exactly on the boundary, so compare with a tolerance
+	// rather than for equality: 40/120 is the anchor itself.
+	if sg.Value < 0.99 {
+		t.Fatalf("signal value = %.4f, want saturation at the measured cycle density", sg.Value)
 	}
 }

@@ -215,17 +215,15 @@ func TestVerdictsEndpointKeepsMemberPIDs(t *testing.T) {
 	}
 }
 
-func TestTreeForMatchesTheListEndpoint(t *testing.T) {
+func TestTreeForVerdictResolvesMembersLikeTheListEndpoint(t *testing.T) {
 	hub := NewHub(func() Health { return Health{} })
-	hub.Publish(verdict(7, 7, 8))
+	v := verdict(7, 7, 8)
+	hub.Publish(v)
 	srv := newTestServer(t, hub)
 
-	tree, ok := srv.treeFor(7)
-	if !ok || tree.Root != 7 || len(tree.Members) != 1 || tree.Members[0].PID != 8 {
-		t.Fatalf("treeFor(7) = %+v, %v", tree, ok)
-	}
-	if _, ok := srv.treeFor(999); ok {
-		t.Fatal("treeFor of an unknown root should report no tree")
+	tree := srv.treeForVerdict(v)
+	if tree.Root != 7 || len(tree.Members) != 1 || tree.Members[0].PID != 8 {
+		t.Fatalf("treeForVerdict = %+v, want the root with member 8", tree)
 	}
 }
 
@@ -423,5 +421,76 @@ func TestStreamOpensImmediatelyAndForwardsTrees(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: ") || !strings.Contains(body, `"root":7`) {
 		t.Errorf("stream did not forward the tree: %q", body)
+	}
+}
+
+// The latest-verdict view is a current assessment, so a verdict for a process
+// that has exited must not sit at the top of the dashboard forever. The history
+// ring is where a past finding belongs.
+func TestRetainDropsVerdictsForExitedProcesses(t *testing.T) {
+	hub := NewHub(func() Health { return Health{} })
+	hub.Publish(verdict(5, 5))
+	hub.Publish(verdict(6, 6))
+	hub.Publish(verdict(0, 0))
+
+	hub.Retain([]int32{6})
+
+	got := map[int32]bool{}
+	for _, v := range hub.Latest() {
+		got[v.PID] = true
+	}
+	if got[5] {
+		t.Error("a verdict for an exited process survived Retain")
+	}
+	if !got[6] {
+		t.Error("a verdict for a live process was dropped")
+	}
+	if !got[0] {
+		t.Error("the host pseudo-root is not a process that can exit and must be kept")
+	}
+
+	// The record of what happened is the history, and it is untouched.
+	if len(hub.History()) != 3 {
+		t.Fatalf("history holds %d verdicts, want all 3", len(hub.History()))
+	}
+}
+
+// A listener that cannot keep up loses messages, and that loss is counted like
+// every other bounded queue in the system.
+func TestSubscriberDropsAreCounted(t *testing.T) {
+	hub := NewHub(func() Health { return Health{} })
+	ch, unsubscribe := hub.Subscribe()
+	defer unsubscribe()
+
+	// Fill the subscriber's buffer, then publish past it without reading.
+	for i := range 200 {
+		hub.Publish(verdict(int32(i+1), int32(i+1)))
+	}
+
+	if got := hub.SubscriberDrops(); got == 0 {
+		t.Fatal("a subscriber that never read a message reported no drops")
+	}
+	if len(ch) == 0 {
+		t.Fatal("the subscriber buffer is empty; the test measured nothing")
+	}
+}
+
+// A subscriber publishing within its buffer loses nothing. Unsubscribing removes
+// the listener; it deliberately does not close the channel, so nothing here waits
+// on the channel itself.
+func TestSubscriberDropsStayZeroWithinTheBuffer(t *testing.T) {
+	hub := NewHub(func() Health { return Health{} })
+	ch, unsubscribe := hub.Subscribe()
+	defer unsubscribe()
+
+	for i := range 50 {
+		hub.Publish(verdict(int32(i+1), int32(i+1)))
+	}
+
+	if got := hub.SubscriberDrops(); got != 0 {
+		t.Fatalf("subscriber drops = %d for 50 verdicts inside a %d buffer", got, cap(ch))
+	}
+	if len(ch) != 50 {
+		t.Fatalf("buffered %d verdicts, want 50", len(ch))
 	}
 }

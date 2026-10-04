@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prateekpurohit13/grima/internal/bus"
@@ -85,21 +86,49 @@ func (t *overrideTracker) For(pid int32) []score.Override {
 	return out
 }
 
-// startFingerprintLoop is the single writer for all fingerprint state.
-func startFingerprintLoop(ctx context.Context, engine *fingerprint.Engine, in <-chan event.Event) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
+// engineLoop owns the fingerprint engine. Every read and every write of window
+// state happens on the goroutine that runs it: events arrive on in and scoring
+// ticks arrive on the ticker, so the scoring pass reads state that the same
+// goroutine wrote. The single-writer invariant (docs/architecture.md §12) is a
+// property of this wiring, not a comment — the engine must never be handed to a
+// second goroutine, which is why its liveness count is published here rather
+// than read by the health handler directly.
+type engineLoop struct {
+	scoreLoop
+	in   <-chan event.Event
+	live *atomic.Int64
+
+	// interval is the scoring cadence. Zero means scoreInterval; tests set it
+	// lower so a loop does not have to run for a second to be observed.
+	interval time.Duration
+}
+
+func (l engineLoop) cadence() time.Duration {
+	if l.interval <= 0 {
+		return scoreInterval
+	}
+	return l.interval
+}
+
+// run blocks until ctx is cancelled or the event channel closes.
+func (l engineLoop) run(ctx context.Context) {
+	ticker := time.NewTicker(l.cadence())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-l.in:
+			if !ok {
 				return
-			case ev, ok := <-in:
-				if !ok {
-					return
-				}
-				engine.Apply(ev)
 			}
+			l.engine.Apply(ev)
+		case <-ticker.C:
+			l.live.Store(int64(l.engine.Live()))
+			l.evaluate()
 		}
-	}()
+	}
 }
 
 // startRuleLoop evaluates rules on raw events, so an override is recorded the
@@ -132,27 +161,31 @@ type scoreLoop struct {
 	hub       *web.Hub
 	baseline  *calibrate.Baseline
 	log       *slog.Logger
+
+	// lastDropped is the bus drop counter as of the previous tick. The signal
+	// reports the drops that happened during the window being scored, not every
+	// drop the process has ever seen: with a lifetime counter, one overload
+	// episode marked every verdict for the rest of the run, and because a verdict
+	// with any signal is published, it also filled the history ring with
+	// info-level noise.
+	lastDropped uint64
 }
 
-func runScoreLoop(ctx context.Context, loop scoreLoop) {
-	ticker := time.NewTicker(scoreInterval)
-	defer ticker.Stop()
+func (l *scoreLoop) evaluate() {
+	// The drop count is a delta over the window being scored, so an overload that
+	// has passed stops marking new verdicts.
+	total := l.events.Stats().Dropped
+	dropped := total - l.lastDropped
+	l.lastDropped = total
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			loop.evaluate()
-		}
-	}
-}
-
-func (l scoreLoop) evaluate() {
-	dropped := l.events.Stats().Dropped
+	roots := l.engine.Roots()
+	// A verdict is the current assessment of a process, so one for a process that
+	// has exited is a ghost: it would sit at the top of the dashboard forever.
+	// The history ring keeps the incident.
+	defer l.hub.Retain(roots)
 
 	hostScored := false
-	for _, root := range l.engine.Roots() {
+	for _, root := range roots {
 		if root == 0 {
 			hostScored = true
 		}
@@ -196,7 +229,7 @@ func worthReporting(v score.Verdict) bool {
 	return len(v.Signals) > 0 || v.Level >= score.LevelLow
 }
 
-func healthSnapshot(startedAt time.Time, events *bus.Bus, sources []sensor.Source, engine *fingerprint.Engine, baseline *calibrate.Baseline) web.Health {
+func healthSnapshot(startedAt time.Time, events *bus.Bus, sources []sensor.Source, live int, baseline *calibrate.Baseline) web.Health {
 	stats := events.Stats()
 
 	// Only sources that started are in this map, so a source that failed to
@@ -218,12 +251,22 @@ func healthSnapshot(startedAt time.Time, events *bus.Bus, sources []sensor.Sourc
 		CalibrationReady: baseline != nil && baseline.Ready(),
 		BusPublished:     stats.Published,
 		BusDropped:       stats.Dropped,
-		LiveProcesses:    engine.Live(),
+		LiveProcesses:    live,
 		Sensors:          sensors,
 		Uptime:           time.Since(startedAt).Seconds(),
 	}
 	if baseline != nil {
 		health.CalibrationAge = time.Since(baseline.CapturedAt).Seconds()
+
+		// Ready is one gate over the whole baseline, so it cannot say which
+		// signals actually have a distribution behind them. Publish the sample
+		// counts: a zero is an unavailable signal, not a quiet host.
+		if health.Extra == nil {
+			health.Extra = make(map[string]uint64, 5)
+		}
+		for name, n := range baseline.Coverage() {
+			health.Extra["baseline_samples_"+name] = uint64(n)
+		}
 	}
 	return health
 }
