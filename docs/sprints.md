@@ -317,7 +317,7 @@ measured while the writer is a guess (§24).
 | 4.10 | Extension novelty | ✅ Alert kept, cost stated: 23 novel writes cross the band, 30 files score 60.0. A minimum-novelty floor was rejected because the floor that moves 30 novel files below the band also silences the 24-file quiet drip that item 2.2 rests on. See §26. |
 | 4.11 | Re-run the signal measurements | ✅ The numbers no longer live in a scratch directory: §17's characterisation is pinned by `internal/fingerprint/split_test.go`, §18's solo alertability by `internal/score/alertability_test.go`, and the live per-scenario signal values are recorded by the ablation runner, so a characterisation can be re-derived from a recorded run. |
 | 4.12 | Per-round spread | ✅ Every headline figure is a range over rounds (`min..max`, with the round count), and a one-round run is labelled a single observation rather than presented as a spread. |
-| 4.13 | Split under causal attribution | ⚠️ **Not measurable here.** Needs `attribution.mode = "audit"` on an elevated host; this environment is not elevated, and the correlate fallback is a byte-volume guess (§24). Carried forward with the reason rather than closed. |
+| 4.13 | Split under causal attribution | ⚠️ **Not measurable here.** Needs `attribution.mode = "audit"` on an elevated host; this environment is not elevated, and the correlate fallback is a byte-volume guess (§24). Carried forward with the reason rather than closed. **Resolution path:** measured on an elevated host when one is available; otherwise a scope statement in the paper's Threats to Validity (5.4) — the same treatment macOS receives. |
 | 4.14 | Bound `FileWatch` startup | ✅ `filewatch.startup_deadline` (default 10s) bounds the walk; the remainder is queued and counted as `add_pending`, the root is always registered inline, and a full queue falls back to registering inline rather than leaving a directory blind. The 403-directory tree still registers inline in 92ms; a 600-directory tree with a nanosecond deadline returns at once and ends fully covered. See §25. |
 
 ---
@@ -336,8 +336,29 @@ measured while the writer is a guess (§24).
 
 ### Buffer sprint
 
-Slip absorption first. Then, in order: macOS sensor set, packaging, reproduction
-instructions, `README` polish. Nothing here is load-bearing.
+Slip absorption first. Then the items below, in order. Nothing here is load-bearing for
+the sprints already closed, but **B0 precedes Sprint 5**: the paper is written from the
+spec, so the spec has to be true before anything is written from it. The audit behind B0
+is recorded in §9.
+
+| # | Item | WS | Exit criterion |
+|---|---|---|---|
+| B0 | **Spec sync.** Fix every stale or missing section the audit found (§9, "Spec sync backlog"): `design.md` §2 event contract (`Cmdline`, `AttribConfidence`), §7 `Baseline` struct (`CreateRate`), §9 rule table (nine rules, no `R-MASS-RENAME`), §11 config reference (`[attribution]`, `[procwatch]`, `[rules]`, `filewatch.sample_interval`, `filewatch.startup_deadline`, `scoring.zero_baseline_burst`) plus a CLI-flag reference and the §12 `add_pending` row; `architecture.md` §3 macOS PersistenceWatch row and §9 rule table; `plan.md` §4 signal taxonomy, §10 layout, and the two settlements below; `README.md` warmup default | all | Every doc matches the shipped code, each fix cross-checked against the cited code location; no doc contradicts another |
+| B1 | **Implement `static_reputation`** (signal #12). Image checks via the standard library — `debug/pe` (Windows), `debug/elf` (Linux): section entropy, unsigned flag, header anomalies — read by `procwatch` at process start, carried on a new compatible `Event` field, accumulated in the fingerprint tree vector, emitted as a Secondary under the corroboration gate | W2 | Signal #12 appears in verdicts; synthetic PE/ELF fixtures drive table-driven tests over matching and non-matching images; `alertability_test.go` prices it; no new dependency; `design.md` §5's row flips to Implemented (in B0) |
+| B2 | **macOS sensor set.** Per-sensor breakdown, and the persistwatch decision made explicit: implement LaunchAgents/LaunchDaemons scanning, or keep the loud error | W1 | Verified on a real macOS host if one is available, otherwise a scope statement in the paper; `architecture.md` §3 matches reality (fixed in B0) |
+| B3 | **Packaging.** `make cross` artifacts, release notes, `THIRD_PARTY_NOTICES.md` complete | W1 | Submission-ready artifacts |
+| B4 | **Reproduction instructions and `README` polish** | W3 | Every §27 harness runnable from a fresh clone |
+| B5 | **Price `dir_fanout`.** Decided: priced, not fixed — the pooled distribution stays. `design.md` §7 records a benign ~40-directory workload alerting at medium *after* recalibration; measure that residual on the benign corpus | W3 | The residual alert measured on the corpus, the number recorded, and its meaning stated in the paper (feeds 5.1 and 5.4); `design.md` §7 gains the pointer (in B0) |
+
+**Scope decided, recorded here because the schedule must carry it** (the corresponding
+`plan.md` lines land with B0):
+
+- **Linux causal attribution is out of scope.** The remaining user-space candidates are
+  auditd, which needs root and the kernel audit subsystem, and eBPF, which is already a
+  `design.md` §15 non-goal. Linux files evidence at the host or correlate level, so the
+  multi-process split (Gap 2) stays unaddressed there, and the paper states it.
+- **The WMI persistence stretch is dropped.** Run keys, Scheduled Tasks and Services are
+  the final scope of PersistenceWatch on Windows.
 
 ---
 
@@ -402,13 +423,33 @@ Verified against the code, not assumed:
 
 | Gap | Evidence | Where it lands |
 |---|---|---|
-| ~~`window.ngram_length` is dead config~~ | **Resolved in Sprint 2** — the ring's event-kind sequence is scored as signal #14 `ngram_rename_chain` (Secondary, weight 0.5) | Done; see `design.md` §6 |
+| ~~`window.ngram_length` is dead config~~ | **Resolved in Sprint 2** — the ring's event-kind sequence is scored as signal #14 `ngram_rename_chain` (Secondary, shipped at weight 0.2) | Done; see `design.md` §6 |
 | ~~Attribution unreliable~~ | **Resolved in Sprint 1** — correlation measured 0%, causal attribution measured 96.9%. Elevation is now a deployment requirement, not a gap | Done; see §11 |
 | ~~Decoy touch never observed firing~~ | **Resolved in Sprint 1** — verified in unit tests and end to end at critical | Done |
 | **Suspend path untested** | Implemented for Windows and POSIX, never executed | Sprint 3 item 3.2 |
 | ~~Overflow rescan untested~~ | **Resolved in Sprint 1** — 6 tests, revert-checked so the test fails if the rescan call is removed | Done |
 | **macOS unverified** | The adapter compiles but no macOS host has produced an event through it | Scope statement in the paper; see §10 |
-| **`static_reputation` signal absent** | Documented as Phase 7; correctly marked "not yet emitted" in `design.md` §5 | Buffer or never |
+| **`static_reputation` signal absent** | Documented as Phase 7; correctly marked "not yet emitted" in `design.md` §5 | Buffer item B1 |
+
+### Spec sync backlog — lands in Buffer item B0
+
+Found by auditing the shipped code against the spec. Each row is a statement the
+authoritative docs get wrong or omit; B0 resolves every one.
+
+| Finding | Evidence | Lands in |
+|---|---|---|
+| A rule that does not exist | `R-MASS-RENAME` is listed in `design.md` §9 and `architecture.md` §9; the engine has nine rules (`internal/rules/rules.go`) and none is MASS-RENAME — rename-to-unseen-extension is carried by signals 5 and 6, `rename_burst` and `unknown_extension_activity` | B0 |
+| Three shipped rules missing from the spec | `R-FIREWALL-OFF`, `R-SERVICE-TAMPER`, `R-EDR-KILL` are in `internal/rules/rules.go` and `THIRD_PARTY_NOTICES.md`; both §9 tables (`design.md`, `architecture.md`) list only the original seven | B0 |
+| The frozen contract is behind the code | `internal/event/event.go` carries `Cmdline` and `AttribConfidence`; `design.md` §2 lists neither in the struct or the field-semantics table | B0 |
+| The authoritative config reference is incomplete | The `[attribution]`, `[procwatch]` and `[rules]` sections, and the keys `filewatch.sample_interval`, `filewatch.startup_deadline` and `scoring.zero_baseline_burst`, exist in `internal/config/config.go` and `configs/grima.example.toml`; `design.md` §11 has none of them | B0 |
+| `design.md` disagrees with itself on `CreateRate` | §5's `create_burst` row reads `CreateRate`; §7's `Baseline` struct does not declare it — `internal/calibrate/calibrate.go` does | B0 |
+| macOS persistence watching is not implemented | `architecture.md` §3 claims LaunchAgents/LaunchDaemons/cron; `persistwatch_other.go` returns an error on every platform but Linux and Windows | B0 |
+| Warm-up default stated wrongly | README says `calibration.warmup` is "15 s by default"; the code default and the example config are 10 minutes | B0 |
+| Stale signal taxonomy | `plan.md` §4 lists 13 signals without `create_burst` or `ngram_rename_chain`; `design.md` §5 lists 15 | B0 |
+| Layouts miss a package | `internal/config` is absent from `plan.md` §10 and `architecture.md` §14 | B0 |
+| Observability table miss | `add_pending` is surfaced by `/healthz` and named in `architecture.md` §13, but absent from `design.md` §12 | B0 |
+| CLI surface undocumented in the spec | `--config`, `--duration`, `--calibrate`, `--recalibrate`, `--remove-decoys`, `--version` exist in `cmd/grima/main.go` and README only | B0 |
+| The two scope decisions need their text | Linux attribution's `plan.md` §9 non-goal and `architecture.md` §13 wording; the WMI settlement in `plan.md` §11 | B0 |
 
 ---
 
