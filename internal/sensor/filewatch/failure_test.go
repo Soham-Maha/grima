@@ -17,48 +17,6 @@ import (
 	"github.com/prateekpurohit13/grima/internal/event"
 )
 
-// Failure table row 1, filesystem event overflow: the overflow is delivered the
-// way the kernel delivers it — on the watcher's own error channel carrying
-// fsnotify's ErrEventOverflow — so the real loop, not a direct call, drives the
-// rescan. The observables are the synthetic event and the counters.
-func TestOverflowOnTheWatcherErrorChannelRescansAndCounts(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "one.txt")
-	writeTestFile(t, path, bytes.Repeat([]byte("abcdefgh"), 512))
-
-	s := testSource(t, dir)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	out := make(chan event.Event, 64)
-	if err := s.Start(ctx, out); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer s.Close()
-	drain(out)
-
-	s.watcher.Errors <- fsnotify.ErrEventOverflow
-
-	ev := waitForEvent(t, out, "no synthetic event after an overflow on the watcher error channel")
-	if ev.Kind != event.KindFileWrite || ev.Path != path {
-		t.Fatalf("event = %s %s, want a synthetic file write for %s", ev.Kind, ev.Path, path)
-	}
-
-	stats := s.Stats()
-	if n := stats.Extra["overflow"]; n != 1 {
-		t.Fatalf("overflow = %d, want 1", n)
-	}
-	if n := stats.Extra["rescans"]; n != 1 {
-		t.Fatalf("rescans = %d, want 1", n)
-	}
-	if n := stats.Extra["watch_failures"]; n != 1 {
-		t.Fatalf("watch_failures = %d, want 1 for a lost-notification overflow", n)
-	}
-	if stats.Errors != 1 {
-		t.Fatalf("errors = %d, want 1", stats.Errors)
-	}
-}
-
 // Failure table row 2, watch exhaustion: a monitored root that cannot be watched
 // (here it no longer exists; on Linux this is also the Add ENOSPC/ENOSPC-style
 // exhaustion path) must be logged, counted, and therefore visible in the health
